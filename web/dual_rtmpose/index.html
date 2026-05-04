@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>fitra-cam dual RTMPose viewer</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <h1>fitra-cam 2D skeleton viewer</h1>
+        <p class="subtitle">2カメラの 2D 姿勢推定結果を skeleton-only で可視化</p>
+      </div>
+      <div class="connection">
+        <span class="label">connection</span>
+        <strong id="connection-status">connecting</strong>
+      </div>
+    </header>
+
+    <section class="runner-status">
+      <div class="metric">
+        <span class="label">runner</span>
+        <strong id="runner-status">idle</strong>
+      </div>
+      <div class="metric grow">
+        <span class="label">message</span>
+        <strong id="runner-message">waiting to start</strong>
+      </div>
+      <div class="metric">
+        <span class="label">bundle seq</span>
+        <strong id="bundle-sequence">0</strong>
+      </div>
+    </section>
+
+    <main class="grid">
+      <section class="camera-panel" data-camera-id="cam0">
+        <div class="panel-header">
+          <h2>cam0</h2>
+          <div class="panel-metrics">
+            <span>recv <strong data-field="receive-fps">0.0</strong> fps</span>
+            <span>render <strong data-field="render-fps">0.0</strong> fps</span>
+            <span>lat <strong data-field="latency-ms">-</strong> ms</span>
+          </div>
+        </div>
+        <canvas data-role="canvas" width="1280" height="720"></canvas>
+        <div class="stats">
+          <div><span class="label">sequence</span><strong data-field="sequence">-</strong></div>
+          <div><span class="label">persons</span><strong data-field="persons">0</strong></div>
+          <div><span class="label">visible kpts</span><strong data-field="visible-kpts">0</strong></div>
+          <div><span class="label">max score</span><strong data-field="max-score">0.00</strong></div>
+          <div><span class="label">avg pose fps</span><strong data-field="avg-fps">0.0</strong></div>
+          <div><span class="label">recent pose fps</span><strong data-field="recent-fps">0.0</strong></div>
+          <div><span class="label">avg publish fps</span><strong data-field="avg-publish-fps">0.0</strong></div>
+          <div><span class="label">stage total</span><strong data-field="stage-total-ms">0.0</strong> ms</div>
+          <div><span class="label">pending frames</span><strong data-field="pending-frames">0</strong></div>
+          <div><span class="label">failures</span><strong data-field="failures">0</strong></div>
+        </div>
+      </section>
+
+      <section class="camera-panel" data-camera-id="cam1">
+        <div class="panel-header">
+          <h2>cam1</h2>
+          <div class="panel-metrics">
+            <span>recv <strong data-field="receive-fps">0.0</strong> fps</span>
+            <span>render <strong data-field="render-fps">0.0</strong> fps</span>
+            <span>lat <strong data-field="latency-ms">-</strong> ms</span>
+          </div>
+        </div>
+        <canvas data-role="canvas" width="1280" height="720"></canvas>
+        <div class="stats">
+          <div><span class="label">sequence</span><strong data-field="sequence">-</strong></div>
+          <div><span class="label">persons</span><strong data-field="persons">0</strong></div>
+          <div><span class="label">visible kpts</span><strong data-field="visible-kpts">0</strong></div>
+          <div><span class="label">max score</span><strong data-field="max-score">0.00</strong></div>
+          <div><span class="label">avg pose fps</span><strong data-field="avg-fps">0.0</strong></div>
+          <div><span class="label">recent pose fps</span><strong data-field="recent-fps">0.0</strong></div>
+          <div><span class="label">avg publish fps</span><strong data-field="avg-publish-fps">0.0</strong></div>
+          <div><span class="label">stage total</span><strong data-field="stage-total-ms">0.0</strong> ms</div>
+          <div><span class="label">pending frames</span><strong data-field="pending-frames">0</strong></div>
+          <div><span class="label">failures</span><strong data-field="failures">0</strong></div>
+        </div>
+      </section>
+    </main>
+
+    <script src="/static/app.js" defer></script>
+  </body>
+</html>
