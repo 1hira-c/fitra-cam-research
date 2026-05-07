@@ -65,6 +65,173 @@ COCO_SKELETON_EDGES = [
 
 
 @dataclass
+class KeypointKalmanState:
+    state: np.ndarray = field(default_factory=lambda: np.zeros(4, dtype=np.float64))
+    covariance: np.ndarray = field(
+        default_factory=lambda: np.eye(4, dtype=np.float64) * 1000.0
+    )
+    initialized: bool = False
+    missed_updates: int = 0
+
+
+class PoseKalmanSmoother:
+    def __init__(
+        self,
+        *,
+        score_threshold: float,
+        delay_ms: float,
+        max_missed_updates: int = 8,
+    ) -> None:
+        self.score_threshold = score_threshold
+        self.delay_ms = max(0.0, delay_ms)
+        self.max_missed_updates = max_missed_updates
+        self.last_timestamp: float | None = None
+        self.states: dict[tuple[int, int], KeypointKalmanState] = {}
+
+    def smooth(self, keypoints, scores, timestamp: float):
+        keypoint_array = np.asarray(keypoints)
+        score_array = np.asarray(scores)
+        if keypoint_array.size == 0 or score_array.size == 0:
+            self.reset()
+            return keypoints, scores
+        if (
+            keypoint_array.ndim != 3
+            or keypoint_array.shape[-1] < 2
+            or score_array.ndim != 2
+        ):
+            return keypoints, scores
+
+        dt = self._next_dt(timestamp)
+        smoothed = keypoint_array.astype(np.float64, copy=True)
+        active_keys: set[tuple[int, int]] = set()
+        person_count = min(smoothed.shape[0], score_array.shape[0])
+
+        for person_index in range(person_count):
+            keypoint_count = min(smoothed.shape[1], score_array.shape[1])
+            for keypoint_index in range(keypoint_count):
+                key = (person_index, keypoint_index)
+                active_keys.add(key)
+                state = self.states.setdefault(key, KeypointKalmanState())
+                x = float(smoothed[person_index, keypoint_index, 0])
+                y = float(smoothed[person_index, keypoint_index, 1])
+                score = float(score_array[person_index, keypoint_index])
+                predicted = self._predict(state, dt)
+
+                if (
+                    math.isfinite(x)
+                    and math.isfinite(y)
+                    and math.isfinite(score)
+                    and score >= self.score_threshold
+                ):
+                    self._update(state, np.array([x, y], dtype=np.float64), dt)
+                elif predicted:
+                    state.missed_updates += 1
+
+                if state.initialized and state.missed_updates <= self.max_missed_updates:
+                    smoothed[person_index, keypoint_index, 0] = state.state[0]
+                    smoothed[person_index, keypoint_index, 1] = state.state[1]
+
+        for key in list(self.states):
+            if key not in active_keys:
+                state = self.states[key]
+                self._predict(state, dt)
+                state.missed_updates += 1
+                if state.missed_updates > self.max_missed_updates:
+                    del self.states[key]
+
+        if isinstance(keypoints, np.ndarray):
+            return smoothed.astype(keypoints.dtype, copy=False), scores
+        return smoothed.tolist(), scores
+
+    def reset(self) -> None:
+        self.last_timestamp = None
+        self.states.clear()
+
+    def _next_dt(self, timestamp: float) -> float:
+        if self.last_timestamp is None:
+            self.last_timestamp = timestamp
+            return 1.0 / 30.0
+        dt = max(1.0 / 240.0, min(0.25, timestamp - self.last_timestamp))
+        self.last_timestamp = timestamp
+        return dt
+
+    def _predict(self, state: KeypointKalmanState, dt: float) -> bool:
+        if not state.initialized:
+            return False
+
+        transition = np.array(
+            [
+                [1.0, 0.0, dt, 0.0],
+                [0.0, 1.0, 0.0, dt],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+            dtype=np.float64,
+        )
+        process = self._process_noise(dt)
+        state.state = transition @ state.state
+        state.covariance = transition @ state.covariance @ transition.T + process
+        return True
+
+    def _update(
+        self, state: KeypointKalmanState, measurement: np.ndarray, dt: float
+    ) -> None:
+        if not state.initialized:
+            state.state[:2] = measurement
+            state.state[2:] = 0.0
+            initial_pos_var = max(4.0, self._measurement_variance())
+            state.covariance = np.diag(
+                [initial_pos_var, initial_pos_var, 2500.0, 2500.0]
+            ).astype(np.float64)
+            state.initialized = True
+            state.missed_updates = 0
+            return
+
+        observation = np.array(
+            [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]], dtype=np.float64
+        )
+        measurement_noise = np.eye(2, dtype=np.float64) * self._measurement_variance()
+        innovation = measurement - observation @ state.state
+        innovation_covariance = (
+            observation @ state.covariance @ observation.T + measurement_noise
+        )
+        gain = state.covariance @ observation.T @ np.linalg.inv(innovation_covariance)
+        state.state = state.state + gain @ innovation
+        identity = np.eye(4, dtype=np.float64)
+        state.covariance = (identity - gain @ observation) @ state.covariance
+
+        velocity_gain = min(1.0, dt / max(0.001, self.delay_ms / 1000.0))
+        state.state[2] = (1.0 - velocity_gain) * state.state[2] + velocity_gain * (
+            innovation[0] / max(dt, 1e-3)
+        )
+        state.state[3] = (1.0 - velocity_gain) * state.state[3] + velocity_gain * (
+            innovation[1] / max(dt, 1e-3)
+        )
+        state.missed_updates = 0
+
+    def _measurement_variance(self) -> float:
+        if self.delay_ms <= 0.0:
+            return 1.0
+        return max(1.0, (self.delay_ms / 20.0) ** 2)
+
+    def _process_noise(self, dt: float) -> np.ndarray:
+        accel_std = max(150.0, 1200.0 / max(1.0, self.delay_ms / 40.0))
+        q = accel_std * accel_std
+        dt2 = dt * dt
+        dt3 = dt2 * dt
+        dt4 = dt2 * dt2
+        return np.array(
+            [
+                [dt4 / 4.0 * q, 0.0, dt3 / 2.0 * q, 0.0],
+                [0.0, dt4 / 4.0 * q, 0.0, dt3 / 2.0 * q],
+                [dt3 / 2.0 * q, 0.0, dt2 * q, 0.0],
+                [0.0, dt3 / 2.0 * q, 0.0, dt2 * q],
+            ],
+            dtype=np.float64,
+        )
+
+
+@dataclass
 class CameraRuntime:
     name: str
     path: str
@@ -84,6 +251,7 @@ class CameraRuntime:
     inferred_frame_index: int = 0
     frame_times: deque[float] = field(default_factory=lambda: deque(maxlen=60))
     latest_annotated: Any = None
+    smoother: PoseKalmanSmoother | None = None
     lock: threading.Lock = field(default_factory=threading.Lock)
 
 
@@ -107,6 +275,8 @@ class RunnerConfig:
     display: bool = False
     publish_every: int = 1
     log_every: float = 10.0
+    smoothing: bool = True
+    smoothing_delay_ms: float = 200.0
     trt_cache_dir: str = "outputs/tensorrt_engines"
     trt_fp16: bool = True
     trt_warmup_frames: int = 0
@@ -232,6 +402,22 @@ def add_common_camera_args(parser, *, include_display: bool) -> None:
         help="Print per-camera progress every N seconds. 0 disables periodic logs.",
     )
     parser.add_argument(
+        "--smoothing-delay-ms",
+        type=float,
+        default=200.0,
+        help=(
+            "Kalman smoothing target visual delay in milliseconds. "
+            "Higher values smooth more. Default: 200."
+        ),
+    )
+    parser.add_argument(
+        "--no-smoothing",
+        dest="smoothing",
+        action="store_false",
+        default=True,
+        help="Disable Kalman keypoint smoothing and publish raw pose output.",
+    )
+    parser.add_argument(
         "--trt-cache-dir",
         default="outputs/tensorrt_engines",
         help="TensorRT engine/timing cache directory used when --device tensorrt is selected.",
@@ -285,6 +471,8 @@ def build_runner_config(args, *, allow_display: bool) -> RunnerConfig:
         raise ValueError("--publish-every must be >= 1.")
     if args.log_every < 0:
         raise ValueError("--log-every must be >= 0.")
+    if args.smoothing_delay_ms < 0:
+        raise ValueError("--smoothing-delay-ms must be >= 0.")
     if args.trt_warmup_frames < 0:
         raise ValueError("--trt-warmup-frames must be >= 0.")
 
@@ -307,6 +495,8 @@ def build_runner_config(args, *, allow_display: bool) -> RunnerConfig:
         display=getattr(args, "display", False) if allow_display else False,
         publish_every=args.publish_every,
         log_every=args.log_every,
+        smoothing=args.smoothing,
+        smoothing_delay_ms=args.smoothing_delay_ms,
         trt_cache_dir=args.trt_cache_dir,
         trt_fp16=args.trt_fp16,
         trt_warmup_frames=args.trt_warmup_frames,
@@ -749,12 +939,21 @@ def create_tracker(
     return tracker
 
 
-def runtime_metadata(runtime_selection: RuntimeSelection) -> dict[str, Any]:
+def runtime_metadata(
+    runtime_selection: RuntimeSelection,
+    config: RunnerConfig | None = None,
+) -> dict[str, Any]:
     metadata: dict[str, Any] = {
         "backend": runtime_selection.backend,
         "device": runtime_selection.device,
         "provider": runtime_selection.provider,
     }
+    if config is not None:
+        metadata["smoothing"] = {
+            "enabled": config.smoothing,
+            "type": "kalman" if config.smoothing else "none",
+            "delay_ms": config.smoothing_delay_ms if config.smoothing else 0.0,
+        }
     if runtime_selection.uses_tensorrt:
         metadata["trt_fp16"] = runtime_selection.trt_fp16
         metadata["trt_cache_dir"] = runtime_selection.trt_cache_dir
@@ -834,6 +1033,7 @@ def build_pose_payload(
     runtime: CameraRuntime,
     *,
     runtime_selection: RuntimeSelection,
+    config: RunnerConfig,
     kpt_thr: float,
     frame,
     keypoints,
@@ -866,7 +1066,7 @@ def build_pose_payload(
         "camera_path": runtime.path,
         "sequence": frames,
         "server_publish_ts": time.time(),
-        "runtime": runtime_metadata(runtime_selection),
+        "runtime": runtime_metadata(runtime_selection, config),
         "frame_size": {
             "width": int(frame.shape[1]),
             "height": int(frame.shape[0]),
@@ -900,6 +1100,7 @@ def build_summary(
     runtimes: list[CameraRuntime],
     total_sec: float,
     runtime_selection: RuntimeSelection,
+    config: RunnerConfig | None = None,
 ) -> dict[str, Any]:
     cameras = []
     for runtime in runtimes:
@@ -940,7 +1141,7 @@ def build_summary(
     return {
         "total_runtime_sec": total_sec,
         "runtime": {
-            **runtime_metadata(runtime_selection),
+            **runtime_metadata(runtime_selection, config),
             "reason": runtime_selection.reason,
         },
         "cameras": cameras,
@@ -1049,6 +1250,14 @@ class DualCameraPoseRunner:
                     path=path,
                     capture=capture,
                     tracker=tracker,
+                    smoother=(
+                        PoseKalmanSmoother(
+                            score_threshold=self.config.kpt_thr,
+                            delay_ms=self.config.smoothing_delay_ms,
+                        )
+                        if self.config.smoothing
+                        else None
+                    ),
                 )
             )
 
@@ -1183,6 +1392,13 @@ class DualCameraPoseRunner:
         keypoints, scores = runtime.tracker(frame)
         if self.config.single_person:
             keypoints, scores = keep_best_person(keypoints, scores)
+        raw_pose_done = time.perf_counter()
+        if runtime.smoother is not None:
+            keypoints, scores = runtime.smoother.smooth(
+                keypoints,
+                scores,
+                raw_pose_done,
+            )
         pose_done = time.perf_counter()
         if is_first_tensorrt_frame:
             print(
@@ -1240,6 +1456,7 @@ class DualCameraPoseRunner:
         payload = build_pose_payload(
             runtime,
             runtime_selection=self.runtime_selection,
+            config=self.config,
             kpt_thr=self.config.kpt_thr,
             frame=frame,
             keypoints=keypoints,
@@ -1385,6 +1602,7 @@ class DualCameraPoseRunner:
                 self.runtimes,
                 total_sec,
                 self.runtime_selection,
+                self.config,
             )
             print("\nSummary")
             for camera in summary["cameras"]:
