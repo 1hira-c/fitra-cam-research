@@ -1,0 +1,11 @@
+# Jetson Orin Nano Super (JetPack 6.2.1, Python 3.10) runtime dependencies.
+#
+# OpenCV is provided by apt's python3-opencv on Jetson; we do not install
+# any pip OpenCV wheel here to avoid shadowing CAP_V4L2 support.
+#
+# onnxruntime is intentionally NOT pinned here. For GPU/TensorRT execution
+# install the Jetson AI Lab `onnxruntime_gpu` wheel manually after this
+# file is applied (see README). The CPU path also works without changes.
+numpy>=1.26,<2.0
+fastapi>=0.115,<0.117
+uvicorn>=0.34,<0.36

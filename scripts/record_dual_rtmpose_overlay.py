@@ -1,416 +1,193 @@
 #!/usr/bin/env python3
+"""Record both cameras for --seconds, then overlay RTMPose skeleton on the
+recorded files. Useful for post-hoc keypoint quality review without
+needing the pose pipeline to keep up with capture in real time.
+"""
+
 from __future__ import annotations
 
 import argparse
-import os
-import site
+import datetime as dt
 import sys
+import threading
 import time
-from dataclasses import dataclass
 from pathlib import Path
 
-os.environ.setdefault("PYTHONNOUSERSITE", "1")
-user_site = site.getusersitepackages()
-sys.path = [path for path in sys.path if path != user_site]
-
 import cv2
+import numpy as np
 
-from dual_rtmpose_core import (
-    DEFAULT_CAMERAS,
-    annotate,
-    create_tracker,
-    ensure_gstreamer_available,
-    open_camera,
-    resolve_runtime_selection,
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from pose_pipeline import (  # noqa: E402
+    CAM_COLORS,
+    CameraConfig,
+    PoseDrawer,
+    add_common_args,
+    build_engines_for,
+    open_v4l2,
 )
 
 
-@dataclass
-class RecordedCamera:
-    name: str
-    path: str
-    raw_path: Path
-    overlay_path: Path
-    frames: int = 0
-    read_failures: int = 0
-
-
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Record two cameras first, then run RTMPose on the saved videos and "
-            "write annotated review videos."
-        )
-    )
-    parser.add_argument(
-        "--camera",
-        action="append",
-        dest="cameras",
-        help="Camera path. Pass twice for two cameras. Defaults to the known by-path devices.",
-    )
+    parser = argparse.ArgumentParser(description="Record dual cameras and overlay RTMPose")
+    add_common_args(parser)
     parser.add_argument("--seconds", type=float, default=30.0)
-    parser.add_argument("--width", type=int, default=640)
-    parser.add_argument("--height", type=int, default=480)
-    parser.add_argument("--fps", type=int, default=30)
-    parser.add_argument(
-        "--gst-decoder",
-        choices=["nvjpegdec", "nvv4l2decoder", "jpegdec"],
-        default="nvv4l2decoder",
-    )
-    parser.add_argument(
-        "--mode",
-        choices=["performance", "balanced", "lightweight"],
-        default="balanced",
-    )
-    parser.add_argument("--det-frequency", type=int, default=10)
-    parser.add_argument(
-        "--tracking",
-        dest="tracking",
-        action="store_true",
-        default=True,
-        help="Enable rtmlib tracking between detector frames.",
-    )
-    parser.add_argument(
-        "--no-tracking",
-        dest="tracking",
-        action="store_false",
-        help="Disable rtmlib tracking and run detector on every processed frame.",
-    )
-    parser.add_argument(
-        "--single-person",
-        dest="single_person",
-        action="store_true",
-        default=True,
-        help="Keep only one detected person and run pose estimation for that target only.",
-    )
-    parser.add_argument(
-        "--multi-person",
-        dest="single_person",
-        action="store_false",
-        help="Keep all detected persons. Useful only for debugging.",
-    )
-    parser.add_argument("--device", default="auto")
-    parser.add_argument(
-        "--backend",
-        choices=["auto", "onnxruntime", "opencv", "openvino"],
-        default="auto",
-    )
-    parser.add_argument(
-        "--trt-cache-dir",
-        default="outputs/tensorrt_engines",
-        help="TensorRT engine/timing cache directory used when --device tensorrt is selected.",
-    )
-    parser.add_argument(
-        "--trt-fp16",
-        dest="trt_fp16",
-        action="store_true",
-        default=True,
-        help="Enable FP16 TensorRT engine build when --device tensorrt is selected.",
-    )
-    parser.add_argument(
-        "--no-trt-fp16",
-        dest="trt_fp16",
-        action="store_false",
-        help="Disable FP16 TensorRT engine build.",
-    )
-    parser.add_argument(
-        "--trt-models",
-        choices=["all", "det", "pose"],
-        default="det",
-        help=(
-            "Apply TensorRT only to selected rtmlib models. det is the default because "
-            "RTMPose on ORT TensorRT EP produced unstable keypoints in Jetson testing. "
-            "all=YOLOX+RTMPose, det=YOLOX only with RTMPose on CUDA, "
-            "pose=RTMPose only with YOLOX on CUDA."
-        ),
-    )
-    parser.add_argument("--kpt-thr", type=float, default=0.4)
     parser.add_argument("--output-dir", default="outputs/recorded_rtmpose")
-    parser.add_argument(
-        "--codec",
-        default="mp4v",
-        help="FourCC for MP4 writing. Use avc1 or H264 if your OpenCV build supports it.",
-    )
     return parser.parse_args()
 
 
-def make_writer(
-    path: Path,
-    codec: str,
-    fps: int,
-    width: int,
-    height: int,
-) -> cv2.VideoWriter:
-    writer = cv2.VideoWriter(
-        str(path),
-        cv2.VideoWriter_fourcc(*codec),
-        float(fps),
-        (width, height),
-    )
-    if not writer.isOpened():
-        raise RuntimeError(f"Failed to open video writer: {path} with codec={codec}")
-    return writer
+def _record_one(cfg: CameraConfig, out_path: Path, duration_s: float, stop: threading.Event) -> tuple[int, float]:
+    """Record raw frames to out_path. Returns (frame_count, actual_fps).
 
-
-def build_session_dir(output_dir: str) -> Path:
-    root = Path(output_dir)
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
-    for index in range(100):
-        suffix = "" if index == 0 else f"_{index:02d}"
-        session_dir = root / f"{timestamp}{suffix}"
-        try:
-            session_dir.mkdir(parents=True, exist_ok=False)
-        except FileExistsError:
-            continue
-        return session_dir
-    raise RuntimeError(f"Failed to create a unique output directory under {root}")
-
-
-def record_raw_videos(
-    args: argparse.Namespace,
-    session_dir: Path,
-) -> list[RecordedCamera]:
-    camera_paths = args.cameras if args.cameras else DEFAULT_CAMERAS
-    if len(camera_paths) != 2:
-        raise ValueError("Pass exactly two --camera values or use the defaults.")
-
-    ensure_gstreamer_available()
-    captures = []
-    writers = []
-    cameras: list[RecordedCamera] = []
-
+    Because two USB 2.0 cameras typically share bandwidth and deliver
+    less than the requested fps, we buffer frames during capture and
+    write with measured fps so playback timing matches reality.
+    """
+    cap = open_v4l2(cfg)
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    buf: list[np.ndarray] = []
+    timestamps: list[float] = []
+    start = time.monotonic()
     try:
-        for index, camera_path in enumerate(camera_paths):
-            name = f"cam{index}"
-            raw_path = session_dir / f"raw_{name}.mp4"
-            overlay_path = session_dir / f"overlay_{name}.mp4"
-            capture = open_camera(
-                camera_path,
-                args.width,
-                args.height,
-                args.fps,
-                args.gst_decoder,
-            )
-            writer = make_writer(
-                raw_path,
-                args.codec,
-                args.fps,
-                args.width,
-                args.height,
-            )
-            captures.append(capture)
-            writers.append(writer)
-            cameras.append(
-                RecordedCamera(
-                    name=name,
-                    path=camera_path,
-                    raw_path=raw_path,
-                    overlay_path=overlay_path,
-                )
-            )
-
-        print(f"Recording {args.seconds:.1f}s from two cameras")
-        deadline = time.perf_counter() + args.seconds
-        while time.perf_counter() < deadline:
-            for camera, capture, writer in zip(cameras, captures, writers):
-                ok, frame = capture.read()
-                if not ok or frame is None:
-                    camera.read_failures += 1
-                    print(f"[warn] failed to read frame from {camera.name}: {camera.path}")
-                    continue
-                if frame.shape[1] != args.width or frame.shape[0] != args.height:
-                    frame = cv2.resize(frame, (args.width, args.height))
-                writer.write(frame)
-                camera.frames += 1
-
-        return cameras
-    finally:
-        for writer in writers:
-            writer.release()
-        for capture in captures:
-            capture.release()
-
-
-def annotate_video(
-    camera: RecordedCamera,
-    args: argparse.Namespace,
-    *,
-    backend: str,
-    device: str,
-    provider_options: dict[str, str] | None,
-    trt_models: str,
-) -> int:
-    capture = cv2.VideoCapture(str(camera.raw_path))
-    if not capture.isOpened():
-        raise RuntimeError(f"Failed to open recorded video: {camera.raw_path}")
-
-    width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH)) or args.width
-    height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT)) or args.height
-    source_fps = capture.get(cv2.CAP_PROP_FPS)
-    output_fps = int(round(source_fps)) if source_fps and source_fps > 0 else args.fps
-    writer = make_writer(camera.overlay_path, args.codec, output_fps, width, height)
-    tracker = create_tracker(
-        args.mode,
-        backend,
-        device,
-        args.det_frequency,
-        args.tracking,
-        args.single_person,
-        provider_options=provider_options,
-        trt_models=trt_models,
-    )
-
-    processed = 0
-    started_at = time.perf_counter()
-    try:
-        while True:
-            ok, frame = capture.read()
+        while not stop.is_set() and (time.monotonic() - start) < duration_s:
+            ok, frame = cap.read()
             if not ok or frame is None:
-                break
-
-            pose_started = time.perf_counter()
-            keypoints, scores = tracker(frame)
-            pose_ms = (time.perf_counter() - pose_started) * 1000.0
-            annotated = annotate(
-                frame,
-                keypoints,
-                scores,
-                args.kpt_thr,
-                camera.name,
-                pose_ms,
-            )
-            cv2.putText(
-                annotated,
-                f"frame {processed + 1}",
-                (20, 62),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (0, 255, 255),
-                2,
-                cv2.LINE_AA,
-            )
-            writer.write(annotated)
-            processed += 1
-
-            if processed % 30 == 0:
-                elapsed = time.perf_counter() - started_at
-                fps = processed / elapsed if elapsed > 0 else 0.0
-                print(f"[pose] {camera.name}: {processed} frames, {fps:.2f} fps")
+                continue
+            buf.append(frame)
+            timestamps.append(time.monotonic())
+    finally:
+        cap.release()
+    n = len(buf)
+    if n < 2:
+        raise RuntimeError(f"recording too short from {cfg.path}: got {n} frames")
+    actual_fps = (n - 1) / (timestamps[-1] - timestamps[0])
+    writer = cv2.VideoWriter(str(out_path), fourcc, float(actual_fps), (cfg.width, cfg.height))
+    if not writer.isOpened():
+        raise RuntimeError(f"failed to open VideoWriter at {out_path}")
+    try:
+        for f in buf:
+            writer.write(f)
     finally:
         writer.release()
-        capture.release()
-
-    return processed
+    return n, actual_fps
 
 
-def write_side_by_side(
-    cameras: list[RecordedCamera],
-    session_dir: Path,
-    args: argparse.Namespace,
-) -> Path:
-    if len(cameras) != 2:
-        raise ValueError("Side-by-side preview requires exactly two cameras.")
-
-    captures = [cv2.VideoCapture(str(camera.overlay_path)) for camera in cameras]
+def _overlay_one(raw_path: Path, out_path: Path, engine, drawer: PoseDrawer, color) -> tuple[int, float, int, int]:
+    cap = cv2.VideoCapture(str(raw_path))
+    if not cap.isOpened():
+        raise RuntimeError(f"failed to open {raw_path}")
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    writer = cv2.VideoWriter(str(out_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+    if not writer.isOpened():
+        cap.release()
+        raise RuntimeError(f"failed to open VideoWriter at {out_path}")
+    seq = 0
     try:
-        for camera, capture in zip(cameras, captures):
-            if not capture.isOpened():
-                raise RuntimeError(f"Failed to open overlay video: {camera.overlay_path}")
+        while True:
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                break
+            seq += 1
+            result = engine.process(seq, frame, time.monotonic())
+            drawer.draw(frame, result.persons, color)
+            writer.write(frame)
+    finally:
+        writer.release()
+        cap.release()
+    return seq, float(fps), w, h
 
-        widths = [
-            int(capture.get(cv2.CAP_PROP_FRAME_WIDTH)) or args.width
-            for capture in captures
-        ]
-        heights = [
-            int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT)) or args.height
-            for capture in captures
-        ]
-        fps = captures[0].get(cv2.CAP_PROP_FPS)
-        output_fps = int(round(fps)) if fps and fps > 0 else args.fps
-        output_height = min(heights)
-        output_widths = [
-            int(width * output_height / height)
-            for width, height in zip(widths, heights)
-        ]
-        side_by_side_path = session_dir / "overlay_side_by_side.mp4"
-        writer = make_writer(
-            side_by_side_path,
-            args.codec,
-            output_fps,
-            sum(output_widths),
-            output_height,
-        )
 
+def _side_by_side(overlay_paths: list[Path], out_path: Path) -> int:
+    caps = [cv2.VideoCapture(str(p)) for p in overlay_paths]
+    try:
+        if not all(c.isOpened() for c in caps):
+            raise RuntimeError("failed to reopen overlay clips for side-by-side composition")
+        fps = caps[0].get(cv2.CAP_PROP_FPS) or 30.0
+        w = int(caps[0].get(cv2.CAP_PROP_FRAME_WIDTH))
+        h = int(caps[0].get(cv2.CAP_PROP_FRAME_HEIGHT))
+        writer = cv2.VideoWriter(str(out_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (w * 2, h))
+        if not writer.isOpened():
+            raise RuntimeError(f"failed to open VideoWriter at {out_path}")
+        n = 0
         try:
             while True:
                 frames = []
-                for capture, output_width in zip(captures, output_widths):
-                    ok, frame = capture.read()
-                    if not ok or frame is None:
-                        return side_by_side_path
-                    if frame.shape[0] != output_height or frame.shape[1] != output_width:
-                        frame = cv2.resize(frame, (output_width, output_height))
-                    frames.append(frame)
-                writer.write(cv2.hconcat(frames))
+                ok_all = True
+                for c in caps:
+                    ok, f = c.read()
+                    if not ok or f is None:
+                        ok_all = False
+                        break
+                    if f.shape[1] != w or f.shape[0] != h:
+                        f = cv2.resize(f, (w, h))
+                    frames.append(f)
+                if not ok_all:
+                    break
+                writer.write(np.hstack(frames))
+                n += 1
         finally:
             writer.release()
+        return n
     finally:
-        for capture in captures:
-            capture.release()
+        for c in caps:
+            c.release()
 
 
 def main() -> int:
     args = parse_args()
-    session_dir = build_session_dir(args.output_dir)
-    runtime_selection = resolve_runtime_selection(
-        args.backend,
-        args.device,
-        trt_cache_dir=args.trt_cache_dir,
-        trt_fp16=args.trt_fp16,
-        trt_models=args.trt_models,
-    )
+    cam_cfgs = [
+        CameraConfig(path=args.cam0, width=args.width, height=args.height,
+                     fps=args.fps, fourcc=args.fourcc),
+        CameraConfig(path=args.cam1, width=args.width, height=args.height,
+                     fps=args.fps, fourcc=args.fourcc),
+    ]
 
-    print(f"Output directory: {session_dir}")
-    print(
-        f"RTMPose runtime: backend={runtime_selection.backend} "
-        f"device={runtime_selection.device} provider={runtime_selection.provider}"
-    )
-    print(f"Runtime note: {runtime_selection.reason}")
-    if runtime_selection.uses_tensorrt:
-        print(
-            "TensorRT: "
-            f"fp16={runtime_selection.trt_fp16}, "
-            f"cache={runtime_selection.trt_cache_dir}"
-            f", models={runtime_selection.trt_models}"
-        )
+    run_ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_dir = Path(args.output_dir) / run_ts
+    out_dir.mkdir(parents=True, exist_ok=True)
+    raw_paths = [out_dir / f"raw_cam{i}.mp4" for i in range(2)]
+    overlay_paths = [out_dir / f"overlay_cam{i}.mp4" for i in range(2)]
+    side_path = out_dir / "overlay_side_by_side.mp4"
 
-    cameras = record_raw_videos(args, session_dir)
-    print("\nRecorded videos")
-    for camera in cameras:
-        print(
-            f"  {camera.name}: {camera.frames} frames, failures={camera.read_failures}, "
-            f"raw={camera.raw_path}"
-        )
+    print(f"[record] writing raw to {out_dir} for {args.seconds:.1f}s", file=sys.stderr)
+    stop = threading.Event()
+    results: dict[int, tuple[int, float]] = {}
+    threads = []
+    for i, (cfg, path) in enumerate(zip(cam_cfgs, raw_paths)):
+        def runner(idx=i, cfg=cfg, path=path):
+            results[idx] = _record_one(cfg, path, args.seconds, stop)
+        t = threading.Thread(target=runner, name=f"Recorder-{i}", daemon=True)
+        t.start()
+        threads.append(t)
+    try:
+        for t in threads:
+            t.join()
+    except KeyboardInterrupt:
+        stop.set()
+        for t in threads:
+            t.join(timeout=2.0)
+        print("[record] interrupted", file=sys.stderr)
+        return 1
+    for i, (n, fps) in sorted(results.items()):
+        print(f"[record] cam{i}: {n} frames @ {fps:.2f}fps -> {raw_paths[i]}", file=sys.stderr)
 
-    print("\nRunning RTMPose on recorded videos")
-    for camera in cameras:
-        processed = annotate_video(
-            camera,
-            args,
-            backend=runtime_selection.backend,
-            device=runtime_selection.device,
-            provider_options=runtime_selection.provider_options,
-            trt_models=args.trt_models,
-        )
-        print(f"  {camera.name}: overlay frames={processed}, path={camera.overlay_path}")
+    print(f"[overlay] building engines (device={args.device})...", file=sys.stderr)
+    engines = build_engines_for(2, args)
+    drawer = PoseDrawer(kp_thr=args.kp_thr)
+    for i, (raw_p, out_p, engine) in enumerate(zip(raw_paths, overlay_paths, engines)):
+        n, fps, w, h = _overlay_one(raw_p, out_p, engine, drawer, CAM_COLORS[i % len(CAM_COLORS)])
+        print(f"[overlay] cam{i}: {n} frames @ {fps:.1f}fps {w}x{h} -> {out_p}", file=sys.stderr)
 
-    side_by_side_path = write_side_by_side(cameras, session_dir, args)
-    print("\nReview outputs")
-    for camera in cameras:
-        print(f"  {camera.name} overlay: {camera.overlay_path}")
-    print(f"  side-by-side: {side_by_side_path}")
+    print(f"[merge] writing {side_path}", file=sys.stderr)
+    n_side = _side_by_side(overlay_paths, side_path)
+    print(f"[merge] wrote {n_side} frames -> {side_path}", file=sys.stderr)
+    print(f"[done] outputs at {out_dir}", file=sys.stderr)
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.exit(main())

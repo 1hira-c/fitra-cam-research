@@ -1,8 +1,0 @@
-# OpenCV comes from apt's python3-opencv so CAP_GSTREAMER stays available.
-# Install rtmlib separately with --no-deps so pip does not pull OpenCV wheels into the venv.
-# JetPack 6.2.1 quick-start uses CPU onnxruntime by default.
-# Do not install the bundled onnxruntime_gpu-1.19.0 wheel on JetPack 6.2.1:
-# it expects libcudnn.so.8, while JetPack 6.2.1 ships cuDNN 9.3.
-onnxruntime==1.23.2
-fastapi==0.115.12
-uvicorn==0.34.2

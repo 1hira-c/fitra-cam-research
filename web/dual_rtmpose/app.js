@@ -1,232 +1,154 @@
-const CAMERA_IDS = ["cam0", "cam1"];
-const PANEL_STATE = new Map();
+"use strict";
 
-const connectionStatusEl = document.getElementById("connection-status");
-const runnerStatusEl = document.getElementById("runner-status");
-const runnerMessageEl = document.getElementById("runner-message");
-const bundleSequenceEl = document.getElementById("bundle-sequence");
+const CAM_COLORS = ["#00dc00", "#ffb400"];
+const KP_THR = 0.3;
+const SKELETON = [
+  [0, 1], [0, 2], [1, 3], [2, 4],
+  [5, 7], [7, 9], [6, 8], [8, 10],
+  [5, 6], [5, 11], [6, 12], [11, 12],
+  [11, 13], [13, 15], [12, 14], [14, 16],
+];
 
-function getPanelState(cameraId) {
-  if (PANEL_STATE.has(cameraId)) {
-    return PANEL_STATE.get(cameraId);
-  }
+const state = {
+  bundles: [null, null],  // latest per-camera bundle (mirrored from server seq)
+  renderFps: [0, 0],
+  renderTimes: [[], []],
+  serverSeq: 0,
+  serverLastMs: 0,
+};
 
-  const root = document.querySelector(`[data-camera-id="${cameraId}"]`);
-  const canvas = root.querySelector('[data-role="canvas"]');
-  const ctx = canvas.getContext("2d");
-  const state = {
-    root,
-    canvas,
-    ctx,
-    payload: null,
-    lastReceivedSequence: null,
-    lastReceivedAtMs: 0,
-    receiveTimes: [],
-    renderTimes: [],
-  };
-  PANEL_STATE.set(cameraId, state);
-  return state;
-}
-
-function setMetric(root, field, value) {
-  const target = root.querySelector(`[data-field="${field}"]`);
-  if (target) {
-    target.textContent = value;
-  }
-}
-
-function formatFps(samples) {
-  if (samples.length < 2) {
-    return "0.0";
-  }
-  const durationMs = samples[samples.length - 1] - samples[0];
-  if (durationMs <= 0) {
-    return "0.0";
-  }
-  return (((samples.length - 1) * 1000) / durationMs).toFixed(1);
-}
-
-function trimOldSamples(samples, nowMs, windowMs = 4000) {
-  while (samples.length > 0 && nowMs - samples[0] > windowMs) {
-    samples.shift();
-  }
-}
-
-function drawSkeletonPanel(panelState) {
-  const { ctx, canvas, payload, root, renderTimes } = panelState;
-  const nowMs = performance.now();
-  renderTimes.push(nowMs);
-  trimOldSamples(renderTimes, nowMs);
-
-  const width = canvas.width;
-  const height = canvas.height;
-  ctx.clearRect(0, 0, width, height);
-  ctx.fillStyle = "#0f172a";
-  ctx.fillRect(0, 0, width, height);
-
-  if (!payload) {
-    ctx.fillStyle = "#94a3b8";
-    ctx.font = "28px sans-serif";
-    ctx.textAlign = "center";
-    ctx.fillText("waiting for pose data", width / 2, height / 2);
-    setMetric(root, "render-fps", formatFps(renderTimes));
-    requestAnimationFrame(() => drawSkeletonPanel(panelState));
-    return;
-  }
-
-  const frameWidth = payload.frame_size.width || width;
-  const frameHeight = payload.frame_size.height || height;
-  const scale = Math.min(width / frameWidth, height / frameHeight);
-  const offsetX = (width - frameWidth * scale) / 2;
-  const offsetY = (height - frameHeight * scale) / 2;
-  const edges = payload.skeleton.edges || [];
-  const scoreThreshold = payload.skeleton.score_threshold ?? 0;
-  const persons = payload.persons || [];
-  const palette = ["#38bdf8", "#fb7185", "#a78bfa", "#facc15"];
-
-  ctx.save();
-  ctx.translate(offsetX, offsetY);
-  ctx.scale(scale, scale);
-
-  persons.forEach((person, personIndex) => {
-    const color = palette[personIndex % palette.length];
-    const keypoints = person.keypoints2d || [];
-    const bbox = person.bbox || null;
-
-    if (bbox) {
-      const [x1, y1, x2, y2] = bbox;
-      ctx.strokeStyle = "rgba(250, 204, 21, 0.65)";
-      ctx.lineWidth = 2 / scale;
-      ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
-    }
-
-    ctx.strokeStyle = color;
-    ctx.lineWidth = 4 / scale;
-    ctx.lineCap = "round";
-    edges.forEach(([startIndex, endIndex]) => {
-      const startPoint = keypoints[startIndex];
-      const endPoint = keypoints[endIndex];
-      if (
-        !startPoint ||
-        !endPoint ||
-        startPoint[2] < scoreThreshold ||
-        endPoint[2] < scoreThreshold
-      ) {
-        return;
-      }
-      ctx.beginPath();
-      ctx.moveTo(startPoint[0], startPoint[1]);
-      ctx.lineTo(endPoint[0], endPoint[1]);
-      ctx.stroke();
-    });
-
-    keypoints.forEach(([x, y, score]) => {
-      if (score < scoreThreshold) {
-        return;
-      }
-      ctx.beginPath();
-      ctx.fillStyle = color;
-      ctx.arc(x, y, 6 / scale, 0, Math.PI * 2);
-      ctx.fill();
-    });
-  });
-
-  ctx.restore();
-
-  const latencyMs = Math.max(0, Date.now() - payload.server_publish_ts * 1000);
-  const keypointStats = persons.reduce(
-    (summary, person) => {
-      const stats = person.keypoint_stats || {};
-      return {
-        visibleCount: summary.visibleCount + (stats.visible_count || 0),
-        maxScore: Math.max(summary.maxScore, stats.max_score || 0),
-      };
-    },
-    { visibleCount: 0, maxScore: 0 },
-  );
-  setMetric(root, "sequence", String(payload.sequence));
-  setMetric(root, "persons", String(persons.length));
-  setMetric(root, "visible-kpts", String(keypointStats.visibleCount));
-  setMetric(root, "max-score", keypointStats.maxScore.toFixed(2));
-  setMetric(root, "avg-fps", payload.metrics.avg_fps.toFixed(1));
-  setMetric(root, "recent-fps", (payload.metrics.recent_fps || 0).toFixed(1));
-  setMetric(root, "avg-publish-fps", payload.metrics.avg_publish_fps.toFixed(1));
-  setMetric(root, "stage-total-ms", payload.stage_ms.total.toFixed(1));
-  setMetric(
-    root,
-    "pending-frames",
-    String(payload.metrics.pending_frames || payload.metrics.dropped_frames || 0),
-  );
-  setMetric(root, "failures", String(payload.metrics.failures));
-  setMetric(root, "latency-ms", latencyMs.toFixed(1));
-  setMetric(root, "render-fps", formatFps(renderTimes));
-
-  requestAnimationFrame(() => drawSkeletonPanel(panelState));
-}
-
-function resizeCanvas(panelState) {
-  const panelWidth = panelState.root.clientWidth - 32;
-  const frameWidth = panelState.payload?.frame_size?.width || 1280;
-  const frameHeight = panelState.payload?.frame_size?.height || 720;
-  const width = Math.max(320, Math.floor(panelWidth));
-  const height = Math.max(180, Math.floor((width * frameHeight) / frameWidth));
-  panelState.canvas.width = width;
-  panelState.canvas.height = height;
-}
-
-function applyBundle(bundle) {
-  runnerStatusEl.textContent = bundle.runner_status;
-  runnerMessageEl.textContent = bundle.runner_message;
-  bundleSequenceEl.textContent = String(bundle.bundle_sequence);
-
-  const cameraPayloads = new Map((bundle.cameras || []).map((camera) => [camera.camera_id, camera]));
-  CAMERA_IDS.forEach((cameraId) => {
-    const panelState = getPanelState(cameraId);
-    const payload = cameraPayloads.get(cameraId) || null;
-    if (payload && payload.sequence !== panelState.lastReceivedSequence) {
-      panelState.payload = payload;
-      panelState.lastReceivedSequence = payload.sequence;
-      panelState.lastReceivedAtMs = performance.now();
-      panelState.receiveTimes.push(panelState.lastReceivedAtMs);
-      trimOldSamples(panelState.receiveTimes, panelState.lastReceivedAtMs);
-      resizeCanvas(panelState);
-    }
-    setMetric(panelState.root, "receive-fps", formatFps(panelState.receiveTimes));
-  });
-}
+const canvases = Array.from(document.querySelectorAll("canvas")).reduce((acc, el) => {
+  acc[Number(el.dataset.cam)] = el;
+  return acc;
+}, {});
+const statsEls = Array.from(document.querySelectorAll(".stats")).reduce((acc, el) => {
+  acc[Number(el.dataset.cam)] = el;
+  return acc;
+}, {});
+const conn = document.getElementById("conn");
 
 function connect() {
-  const scheme = window.location.protocol === "https:" ? "wss" : "ws";
-  const socket = new WebSocket(`${scheme}://${window.location.host}/ws/poses`);
-
-  socket.addEventListener("open", () => {
-    connectionStatusEl.textContent = "connected";
-  });
-
-  socket.addEventListener("message", (event) => {
-    const bundle = JSON.parse(event.data);
-    applyBundle(bundle);
-  });
-
-  socket.addEventListener("close", () => {
-    connectionStatusEl.textContent = "reconnecting";
-    window.setTimeout(connect, 1000);
-  });
-
-  socket.addEventListener("error", () => {
-    connectionStatusEl.textContent = "error";
-    socket.close();
-  });
+  const wsProto = location.protocol === "https:" ? "wss" : "ws";
+  const ws = new WebSocket(`${wsProto}://${location.host}/ws`);
+  ws.onopen = () => {
+    conn.textContent = "live";
+    conn.className = "conn live";
+    // Keep server-side receive_text alive
+    setInterval(() => {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send("ping");
+      }
+    }, 5000);
+  };
+  ws.onclose = () => {
+    conn.textContent = "disconnected — retrying";
+    conn.className = "conn dead";
+    setTimeout(connect, 1500);
+  };
+  ws.onerror = () => {
+    conn.textContent = "error";
+    conn.className = "conn dead";
+  };
+  ws.onmessage = (ev) => {
+    let bundle;
+    try {
+      bundle = JSON.parse(ev.data);
+    } catch (e) {
+      return;
+    }
+    state.serverSeq = bundle.seq;
+    state.serverLastMs = bundle.ts_ms;
+    for (const cam of bundle.cameras) {
+      state.bundles[cam.id] = cam;
+    }
+  };
 }
 
-CAMERA_IDS.forEach((cameraId) => {
-  const panelState = getPanelState(cameraId);
-  resizeCanvas(panelState);
-  drawSkeletonPanel(panelState);
-});
+function drawCamera(camId) {
+  const canvas = canvases[camId];
+  if (!canvas) return;
+  const bundle = state.bundles[camId];
+  const ctx = canvas.getContext("2d");
+  ctx.fillStyle = "#000";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  if (!bundle) {
+    ctx.fillStyle = "#666";
+    ctx.font = "16px monospace";
+    ctx.fillText("(no data)", 16, 32);
+    return;
+  }
+  if (canvas.width !== bundle.w || canvas.height !== bundle.h) {
+    canvas.width = bundle.w;
+    canvas.height = bundle.h;
+  }
+  const color = CAM_COLORS[camId % CAM_COLORS.length];
+  ctx.strokeStyle = color;
+  ctx.fillStyle = color;
+  ctx.lineWidth = 2;
+  for (const person of bundle.persons || []) {
+    if (person.bbox) {
+      const [x1, y1, x2, y2] = person.bbox;
+      ctx.strokeStyle = "#444";
+      ctx.lineWidth = 1;
+      ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 2;
+    }
+    const kpts = person.kpts || [];
+    for (const [a, b] of SKELETON) {
+      if (!kpts[a] || !kpts[b]) continue;
+      if (kpts[a][2] < KP_THR || kpts[b][2] < KP_THR) continue;
+      ctx.beginPath();
+      ctx.moveTo(kpts[a][0], kpts[a][1]);
+      ctx.lineTo(kpts[b][0], kpts[b][1]);
+      ctx.stroke();
+    }
+    for (const kp of kpts) {
+      if (!kp || kp[2] < KP_THR) continue;
+      ctx.beginPath();
+      ctx.arc(kp[0], kp[1], 3, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+}
 
-window.addEventListener("resize", () => {
-  CAMERA_IDS.forEach((cameraId) => resizeCanvas(getPanelState(cameraId)));
-});
+function updateStats(camId) {
+  const bundle = state.bundles[camId];
+  const el = statsEls[camId];
+  if (!el) return;
+  if (!bundle) {
+    el.textContent = "waiting…";
+    return;
+  }
+  const s = bundle.stats || {};
+  const renderFps = state.renderFps[camId].toFixed(1);
+  const latency = bundle.stats && bundle.stats.captured_at_ms && state.serverLastMs
+    ? Math.max(0, state.serverLastMs - bundle.stats.captured_at_ms)
+    : 0;
+  el.textContent =
+    `recv_fps        ${(s.recv_fps ?? 0).toFixed(2)}\n` +
+    `render_fps      ${renderFps}\n` +
+    `recent_pose_fps ${(s.recent_pose_fps ?? 0).toFixed(2)}\n` +
+    `avg_pose_fps    ${(s.avg_pose_fps ?? 0).toFixed(2)}\n` +
+    `stage_ms        ${(s.stage_ms ?? 0).toFixed(1)}\n` +
+    `pending         ${s.pending ?? 0}\n` +
+    `processed       ${s.processed ?? 0}\n` +
+    `latency_ms      ${latency}\n` +
+    `bundle_seq      ${state.serverSeq}`;
+}
+
+function renderTick() {
+  const now = performance.now();
+  for (const camId of [0, 1]) {
+    drawCamera(camId);
+    const times = state.renderTimes[camId];
+    times.push(now);
+    while (times.length && now - times[0] > 1000) times.shift();
+    state.renderFps[camId] = times.length;
+    updateStats(camId);
+  }
+  requestAnimationFrame(renderTick);
+}
 
 connect();
+requestAnimationFrame(renderTick);
