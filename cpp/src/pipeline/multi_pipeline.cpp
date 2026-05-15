@@ -40,8 +40,8 @@ void MultiCameraDriver::loop() {
         std::size_t   person_offset;
         std::size_t   person_count;
     };
-    std::vector<PendingCam>              pending;
-    std::vector<infer::RtmPose::Request> reqs;
+    std::vector<PendingCam>                       pending;
+    std::vector<infer::RtmPose::PrebakedRequest>  reqs;
 
     // Rolling stage breakdown (debug aid; prints every ~3s of work).
     int    iter_count = 0;
@@ -67,9 +67,18 @@ void MultiCameraDriver::loop() {
             pc.idx           = i;
             pc.person_offset = reqs.size();
             pc.person_count  = latest_per_cam_[i].bboxes.size();
-            for (const auto& bb : latest_per_cam_[i].bboxes) {
-                reqs.push_back(infer::RtmPose::Request{
-                    &latest_per_cam_[i].bgr, bb});
+            // FrameSource has already pre-baked the RTMPose inputs.
+            const auto& cam_df = latest_per_cam_[i];
+            const std::size_t per_item =
+                cam_df.chw_concat.empty()
+                    ? 0
+                    : cam_df.chw_concat.size() / std::max<std::size_t>(1, cam_df.bboxes.size());
+            for (std::size_t bi = 0; bi < cam_df.bboxes.size(); ++bi) {
+                infer::RtmPose::PrebakedRequest pr;
+                pr.chw   = cam_df.chw_concat.data() + bi * per_item;
+                pr.M_inv = cam_df.M_invs[bi];
+                pr.bbox  = cam_df.bboxes[bi];
+                reqs.push_back(pr);
             }
             pending.push_back(pc);
         }
@@ -81,9 +90,11 @@ void MultiCameraDriver::loop() {
         auto t_after_poll = std::chrono::steady_clock::now();
 
         // Pass 2: one batched RTMPose call across all cameras' bboxes.
+        // Preprocess already ran on per-camera worker threads — this is
+        // just memcpy + GPU enqueue + sync + SimCC decode.
         std::vector<infer::Person> all_persons;
         if (!reqs.empty()) {
-            all_persons = rtmpose_.infer_batch(reqs);
+            all_persons = rtmpose_.infer_prebaked(reqs);
         }
         auto t_after_rtm = std::chrono::steady_clock::now();
 

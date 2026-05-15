@@ -211,8 +211,11 @@ int main(int argc, char** argv) {
             src_opts.det_frequency = det_frequency;
             src_opts.single_person = !multi_person;
             src_opts.fake_bbox_if_empty = bench_fake_bbox;
+            // Have the per-camera worker pre-bake the RTMPose input so the
+            // central inference thread only does memcpy + GPU + decode.
+            const auto& rtmpose_opts = rtmpose.options();
             sources.push_back(std::make_unique<fitra::camera::FrameSource>(
-                std::move(cap), std::move(yolox), src_opts));
+                std::move(cap), std::move(yolox), src_opts, &rtmpose_opts));
         }
         std::size_t n_cams = sources.size();
 

@@ -37,6 +37,15 @@ public:
         Bbox           bbox{};
     };
 
+    // One pre-baked pose request: caller already ran the affine warp +
+    // normalize + HWC->CHW step on its own thread (typically the per-camera
+    // FrameSource worker). RtmPose only batches the GPU inference + decode.
+    struct PrebakedRequest {
+        const float* chw     = nullptr;  // 3*H*W floats
+        cv::Mat      M_inv;              // 2x3 CV_64F inverse affine
+        Bbox         bbox{};             // for downstream Person.bbox
+    };
+
     struct Options {
         std::string input_name   = "input";
         std::string simcc_x_name = "simcc_x";
@@ -51,30 +60,47 @@ public:
     explicit RtmPose(TrtEngine& engine);
     RtmPose(TrtEngine& engine, Options opts);
 
+    // Free-standing preprocess: affine warp + BGR ImageNet normalize +
+    // HWC->CHW, writing 3*input_h*input_w floats at `dst_chw`. Safe to call
+    // from multiple threads concurrently (no shared scratch).
+    static void preprocess_to_blob(const Options& opts,
+                                   const cv::Mat& frame_bgr,
+                                   const Bbox& bbox,
+                                   float* dst_chw,
+                                   cv::Mat& M_inv_out);
+
+    static std::size_t blob_floats_per_item(const Options& opts) {
+        return static_cast<std::size_t>(3) * opts.input_h * opts.input_w;
+    }
+
+    const Options& options() const { return opts_; }
+
     // Convenience: all bboxes share the same frame (single-camera path).
+    // Internally preprocesses (parallel for n>=2) then runs infer_prebaked.
     std::vector<Person> infer(const cv::Mat& frame_bgr,
                               const std::vector<Bbox>& bboxes);
 
-    // True batched inference. Persons are returned in request order. When
-    // `reqs.size() > opts.max_batch`, the engine is invoked multiple times
-    // with up to max_batch requests each.
+    // True batched inference with preprocessing done internally. For
+    // multi-camera live pipelines, prefer infer_prebaked() so that
+    // preprocess can run in parallel on the per-camera workers.
     std::vector<Person> infer_batch(const std::vector<Request>& reqs);
 
-private:
-    void preprocess_one(const cv::Mat& frame_bgr,
-                        const Bbox& bb,
-                        float* dst_chw,        // points to b * 3*H*W in input_blob_
-                        cv::Mat& M_inv_out);
+    // Batched inference with preprocessed inputs. Persons are returned in
+    // request order; the engine is invoked once per opts.max_batch chunk.
+    std::vector<Person> infer_prebaked(const std::vector<PrebakedRequest>& reqs);
 
+private:
     void run_one_batch(const Request* reqs,
                        std::size_t n,
                        std::vector<Person>& out);
+    void run_one_prebaked(const PrebakedRequest* reqs,
+                          std::size_t n,
+                          std::vector<Person>& out);
 
     TrtEngine& engine_;
     Options    opts_;
 
-    // Reusable host buffers; sized for max_batch. preprocess_one keeps its
-    // warp scratch on the stack so multiple threads can run it in parallel.
+    // Reusable host buffers; sized for max_batch.
     std::vector<float> input_blob_;      // B*3*H*W CHW float32
     std::vector<float> simcc_x_host_;    // B*K*Wx
     std::vector<float> simcc_y_host_;    // B*K*Wy

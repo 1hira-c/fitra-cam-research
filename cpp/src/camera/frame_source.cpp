@@ -10,10 +10,16 @@ namespace fitra::camera {
 
 FrameSource::FrameSource(std::unique_ptr<V4l2Capture> capture,
                          std::unique_ptr<infer::Yolox> yolox,
-                         Options opts)
+                         Options opts,
+                         const infer::RtmPose::Options* rtmpose_opts)
     : capture_{std::move(capture)},
       yolox_{std::move(yolox)},
-      opts_{std::move(opts)} {}
+      opts_{std::move(opts)} {
+    if (rtmpose_opts) {
+        rtmpose_enabled_ = true;
+        rtmpose_opts_    = *rtmpose_opts;
+    }
+}
 
 FrameSource::~FrameSource() {
     try { stop(); } catch (...) {}
@@ -87,6 +93,23 @@ void FrameSource::decode_loop() {
         df.seq         = raw.seq;
         df.captured_at = raw.captured_at;
         df.bboxes      = cached_bboxes_;  // copy of current cache
+
+        if (rtmpose_enabled_ && !df.bboxes.empty()) {
+            // Preprocess each (frame, bbox) into the contiguous CHW block
+            // here on the per-camera worker thread. Phase 6b: shifts the
+            // dominant CPU cost off the central inference thread.
+            const std::size_t per_item =
+                infer::RtmPose::blob_floats_per_item(rtmpose_opts_);
+            df.chw_concat.resize(df.bboxes.size() * per_item);
+            df.M_invs.resize(df.bboxes.size());
+            for (std::size_t i = 0; i < df.bboxes.size(); ++i) {
+                infer::RtmPose::preprocess_to_blob(
+                    rtmpose_opts_, df.bgr, df.bboxes[i],
+                    df.chw_concat.data() + i * per_item,
+                    df.M_invs[i]);
+            }
+        }
+
         {
             std::lock_guard<std::mutex> lk{slot_mu_};
             latest_ = std::move(df);

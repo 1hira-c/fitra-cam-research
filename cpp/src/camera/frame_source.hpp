@@ -31,6 +31,7 @@
 
 #include "camera/jpeg_decoder.hpp"
 #include "camera/v4l2_capture.hpp"
+#include "infer/rtmpose.hpp"
 #include "infer/types.hpp"
 #include "infer/yolox.hpp"
 
@@ -41,6 +42,11 @@ struct DecodedFrame {
     std::uint64_t                        seq{0};
     std::chrono::steady_clock::time_point captured_at{};
     std::vector<infer::Bbox>             bboxes;  // empty if no Yolox or no person
+    // Pre-baked RTMPose inputs aligned 1:1 with `bboxes`. The chw buffer is a
+    // single contiguous block of bboxes.size() * 3*input_h*input_w floats.
+    // Populated when the FrameSource was given a non-null rtmpose_opts.
+    std::vector<float>                   chw_concat;
+    std::vector<cv::Mat>                 M_invs;
 };
 
 class FrameSource {
@@ -56,9 +62,13 @@ public:
     };
 
     // Yolox can be nullptr -> decode-only (no detection).
+    // rtmpose_opts is optional: if provided, the per-camera worker also
+    // pre-bakes the RTMPose input (warp + normalize + HWC->CHW) so the
+    // central inference thread only has to memcpy + GPU + decode.
     FrameSource(std::unique_ptr<V4l2Capture> capture,
                 std::unique_ptr<infer::Yolox> yolox,
-                Options opts);
+                Options opts,
+                const infer::RtmPose::Options* rtmpose_opts = nullptr);
     ~FrameSource();
 
     FrameSource(const FrameSource&) = delete;
@@ -77,9 +87,11 @@ public:
 private:
     void decode_loop();
 
-    std::unique_ptr<V4l2Capture> capture_;
+    std::unique_ptr<V4l2Capture>  capture_;
     std::unique_ptr<infer::Yolox> yolox_;
     Options                       opts_;
+    bool                          rtmpose_enabled_ = false;
+    infer::RtmPose::Options       rtmpose_opts_{};
 
     JpegDecoder            decoder_;
     std::thread            worker_;
