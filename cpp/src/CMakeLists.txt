@@ -18,11 +18,13 @@ target_link_libraries(fitra_infer PUBLIC
     opencv_imgproc
 )
 
-# Camera capture + JPEG decode (Phase 2 baseline). Phase 4 will swap the
-# decode path to GPU NVJPEG.
+# Camera capture + JPEG decode + per-camera decode worker.
+# Phase 4d parallelizes CPU decode across cameras via FrameSource.
+# Full GPU NVJPEG / NvBuffer is a Phase 5 consideration.
 add_library(fitra_camera STATIC
     camera/v4l2_capture.cpp
     camera/jpeg_decoder.cpp
+    camera/frame_source.cpp
 )
 
 target_include_directories(fitra_camera PUBLIC

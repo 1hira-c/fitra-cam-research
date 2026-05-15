@@ -13,59 +13,60 @@ MultiCameraDriver::MultiCameraDriver(
     infer::RtmPose& rtmpose,
     SnapshotBus& bus,
     Options opts)
-    : caps_{std::move(caps)},
-      yolox_{yolox},
+    : yolox_{yolox},
       rtmpose_{rtmpose},
       bus_{bus},
       opts_{std::move(opts)},
-      per_cam_(caps_.size()) {}
+      per_cam_(caps.size()) {
+    sources_.reserve(caps.size());
+    for (auto& c : caps) {
+        sources_.push_back(std::make_unique<camera::FrameSource>(std::move(c)));
+    }
+}
 
 MultiCameraDriver::~MultiCameraDriver() {
     try { stop(); } catch (...) {}
 }
 
 void MultiCameraDriver::start() {
-    for (auto& c : caps_) c->start();
+    for (auto& s : sources_) s->start();
     stop_.store(false);
     worker_ = std::thread{&MultiCameraDriver::loop, this};
-    FITRA_LOG_INFO("multi-camera driver started ({} cameras)", caps_.size());
+    FITRA_LOG_INFO("multi-camera driver started ({} cameras)", sources_.size());
 }
 
 void MultiCameraDriver::stop() {
-    if (!worker_.joinable() && caps_.empty()) return;
+    if (!worker_.joinable() && sources_.empty()) return;
     stop_.store(true);
     if (worker_.joinable()) worker_.join();
-    for (auto& c : caps_) c->stop();
+    for (auto& s : sources_) s->stop();
 }
 
 void MultiCameraDriver::loop() {
-    // Per-iteration scratch (lives across loops to avoid reallocation).
     struct PendingCam {
         std::size_t                          idx;
-        camera::Frame                        raw;
+        std::uint64_t                        seq;
         std::chrono::steady_clock::time_point captured_at;
-        std::size_t                          person_offset;  // into batched persons
+        std::size_t                          person_offset;
         std::size_t                          person_count;
     };
-    std::vector<PendingCam>          pending;
+    std::vector<PendingCam> pending;
     std::vector<infer::RtmPose::Request> reqs;
 
     while (!stop_.load()) {
         pending.clear();
         reqs.clear();
 
-        // Pass 1: capture + decode + (cached) bbox per camera. YOLOX is
-        // serialized but RTMPose accumulates into one batch.
-        for (std::size_t i = 0; i < caps_.size(); ++i) {
+        // Pass 1: poll each camera's decoded frame slot. Decoding itself
+        // happens on the per-source worker threads, so this is just a
+        // mutex-protected swap.
+        for (std::size_t i = 0; i < sources_.size(); ++i) {
             if (stop_.load()) break;
-            camera::Frame raw;
-            if (!caps_[i]->try_pop_latest(raw)) continue;
+            camera::DecodedFrame df;
+            if (!sources_[i]->try_pop_latest_decoded(df)) continue;
 
             auto& cs = per_cam_[i];
-            if (!cs.decoder.decode(raw.jpeg, cs.frame)) {
-                FITRA_LOG_WARN("cam{}: jpeg decode failed for seq={}", i, raw.seq);
-                continue;
-            }
+            cs.frame = std::move(df.bgr);
 
             bool do_detect = (cs.frame_idx % opts_.det_frequency == 0)
                           || cs.cached_bboxes.empty();
@@ -87,9 +88,9 @@ void MultiCameraDriver::loop() {
             }
 
             PendingCam pc;
-            pc.idx          = i;
-            pc.raw          = std::move(raw);
-            pc.captured_at  = pc.raw.captured_at;
+            pc.idx           = i;
+            pc.seq           = df.seq;
+            pc.captured_at   = df.captured_at;
             pc.person_offset = reqs.size();
             pc.person_count  = cs.cached_bboxes.size();
             for (const auto& bb : cs.cached_bboxes) {
@@ -103,13 +104,13 @@ void MultiCameraDriver::loop() {
             continue;
         }
 
-        // Pass 2: one batched RTMPose call (or 0 if nobody had a person).
+        // Pass 2: one batched RTMPose call.
         std::vector<infer::Person> all_persons;
         if (!reqs.empty()) {
             all_persons = rtmpose_.infer_batch(reqs);
         }
 
-        // Pass 3: distribute persons back to per-camera snapshots and update stats.
+        // Pass 3: distribute persons + update stats + snapshot bus.
         auto wall_now = std::chrono::system_clock::now();
         auto now      = std::chrono::steady_clock::now();
         for (const auto& pc : pending) {
@@ -119,9 +120,9 @@ void MultiCameraDriver::loop() {
 
             CameraSnapshot snap;
             snap.id  = static_cast<int>(pc.idx);
-            snap.w   = caps_[pc.idx]->options().width;
-            snap.h   = caps_[pc.idx]->options().height;
-            snap.seq = pc.raw.seq;
+            snap.w   = sources_[pc.idx]->options().width;
+            snap.h   = sources_[pc.idx]->options().height;
+            snap.seq = pc.seq;
             snap.captured_at = pc.captured_at;
             auto lag = std::chrono::duration_cast<std::chrono::milliseconds>(
                           now - pc.captured_at);
@@ -132,11 +133,11 @@ void MultiCameraDriver::loop() {
                     all_persons.begin() + pc.person_offset + pc.person_count);
             }
             snap.bboxes          = cs.cached_bboxes;
-            snap.recv_fps        = caps_[pc.idx]->recv_fps();
+            snap.recv_fps        = sources_[pc.idx]->recv_fps();
             snap.recent_pose_fps = cs.stats.recent_pose_fps;
             snap.avg_pose_fps    = cs.stats.avg_pose_fps;
             snap.processed       = cs.stats.processed_count;
-            std::uint64_t recv = caps_[pc.idx]->total_received();
+            std::uint64_t recv = sources_[pc.idx]->total_received();
             snap.pending         = recv > snap.processed ? recv - snap.processed : 0;
             snap.stage_ms        = cs.stats.last_stage_ms;
             bus_.update(snap);
