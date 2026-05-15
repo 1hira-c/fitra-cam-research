@@ -195,15 +195,53 @@ fitra-cam/
   NvBuffer/DMABUF 前提で侵襲が大きく Phase 5 候補に延期。
 
 ### 4c — FP16 evaluation
-- **RTMPose FP16**: Phase 1 既知の drift 再現 (低スコア keypoint Y が 100-200px ずれる)。
-  原因はおそらく特定レイヤ (おそらく softmax-like output) の reduced range。
-  根本対応には strict types / 入力型固定 / 部分 INT8 が必要、Phase 5 行き。
+- **RTMPose-S FP16**: 壊滅。max kpt L2 = 237 px (raw_cam0.mp4 30 frames)。
+  低スコア帯だけでなく全体的に座標がランダムに飛ぶ。
+- **RTMPose-M FP16**: 健全。max kpt L2 = 2.51 px / p99 = 0.84 px、
+  かつ GPU compute は S FP32 と同等 (B=1 2.78 vs 2.64 ms, B=3 4.69 vs 4.20 ms)。
+  → **S FP16 の異常は容量起因と推測**。狭いチャネル幅で FP16 の動的レンジに
+  乗らない活性化が一部レイヤで発生し argmax が壊れる。M は同じ手順で問題なし。
+  推奨は **RTMPose-M FP16** へシフト (S FP32 から速度を落とさず精度を上げる)。
 - **YOLOX FP16**: 推論は 1.6× 高速 (5.87 → 3.67 ms GPU)、
   しかし bbox 微差 (IoU 0.93) が RTMPose の crop に伝播し
   最終 keypoint で max 4.6 px の差。プロダクション許容範囲だが
   Phase 1 の correctness 基準 (IoU > 0.99) は満たさない。
   → デフォルトは FP32 のまま、`--det-engine models/yolox_tiny.fp16.engine`
   を選択肢として提供。
+
+### 4c 補足 — 全 (model, precision) ベンチ表 (raw_cam0.mp4 30 frames vs Python ORT CPU)
+
+| pose engine | GPU B=1 | GPU B=3 | max kpt L2 | mean | p99 | bbox IoU min | 判定 |
+|---|---|---|---|---|---|---|---|
+| RTMPose-S FP32 | 2.64 ms | 4.20 ms | 1.15 px | 0.10 | 0.75 | 0.993 | ✓ 現 default |
+| **RTMPose-M FP16** | **2.78 ms** | **4.69 ms** | **2.51 px** | **0.16** | **0.84** | 0.993 | **✓ 推奨** |
+| RTMPose-M FP32 | 4.63 ms | 8.87 ms | 1.66 px | 0.07 | 0.63 | 0.993 | ✓ (遅) |
+| RTMPose-S FP16 | 2.30 ms | 3.40 ms | **237 px** | 63.0 | 201 | 0.993 | ✗ 壊滅 |
+
+(YOLOX は 全行 FP32 engine 固定で比較)
+
+### 4c 補足 — RTMPose-S FP16 壊れ方の per-keypoint パターン
+
+raw_cam0.mp4 30 frames で、S FP16 と Python ORT CPU の keypoint diff を kp 別に集計:
+
+| keypoint        | max (px) | mean (px) |
+|---|---|---|
+| nose, l_eye, r_eye | 189–194 | 110–172 |
+| l_ear, r_ear        | 193–203 | 105–169 |
+| **l_shoulder, r_shoulder** | **0.74–1.23** | **0.37–0.59** |
+| l_elbow / r_elbow / wrist / hip / knee / ankle | 60–237 | 8–176 |
+
+スコア帯別の mean drift:
+
+| ref score 帯 | S FP16 mean | S FP16 max | M FP16 mean | M FP16 max |
+|---|---|---|---|---|
+| ≥ 0.7  | 71.9 px | 210.7 | 0.11 px | 0.92 |
+| 0.3–0.7 | 47.9 px | 237.1 | 0.29 px | 2.51 |
+| < 0.3  | 41.6 px | 143.1 | 0.82 px | 1.20 |
+
+**観察**: スコアと drift が無相関で、**両肩だけ無事 / それ以外は全滅** という配置依存パターン。
+SimCC head の argmax が FP16 のビン比較反転で別位置に飛んでいると説明可能。M はこの不安定領域が消える。
+要 follow-up (将来): trtexec の `--exportTimes` / TRT API で intermediate tensor (simcc_x/y 自体) を dump して、ピーク bin の値・隣接 bin との比、を S/M で比較すれば原因確定する。
 
 ### ベンチ表 (live 2 cam, det-frequency=10, 持続値)
 
