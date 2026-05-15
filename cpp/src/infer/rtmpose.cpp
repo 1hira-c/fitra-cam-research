@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <stdexcept>
 
 #include <opencv2/imgproc.hpp>
@@ -72,29 +73,8 @@ cv::Mat warp_matrix(const cv::Point2f& center,
                : cv::getAffineTransform(src, dst);
 }
 
-// HWC float32 BGR -> CHW float32 BGR (preserve channel order).
-void hwc_float_to_chw(const cv::Mat& hwc_bgr_f, std::vector<float>& chw) {
-    CV_Assert(hwc_bgr_f.type() == CV_32FC3);
-    int H = hwc_bgr_f.rows;
-    int W = hwc_bgr_f.cols;
-    int C = 3;
-    chw.resize(static_cast<std::size_t>(C) * H * W);
-    for (int y = 0; y < H; ++y) {
-        const float* row = hwc_bgr_f.ptr<float>(y);
-        for (int x = 0; x < W; ++x) {
-            float b = row[x * 3 + 0];
-            float g = row[x * 3 + 1];
-            float r = row[x * 3 + 2];
-            chw[0 * H * W + y * W + x] = b;
-            chw[1 * H * W + y * W + x] = g;
-            chw[2 * H * W + y * W + x] = r;
-        }
-    }
-}
-
 void apply_affine_inplace(const cv::Mat& M_inv_2x3,
                           std::array<Keypoint, kNumKeypoints>& kpts) {
-    // M_inv from cv::getAffineTransform is CV_64F.
     CV_Assert(M_inv_2x3.rows == 2 && M_inv_2x3.cols == 3
               && M_inv_2x3.type() == CV_64F);
     const double* m = M_inv_2x3.ptr<double>();
@@ -115,8 +95,12 @@ RtmPose::RtmPose(TrtEngine& engine) : RtmPose(engine, Options{}) {}
 RtmPose::RtmPose(TrtEngine& engine, Options opts)
     : engine_{engine}, opts_{std::move(opts)} {}
 
+// Writes a normalized BGR CHW tensor for one (frame, bbox) into the
+// destination region of input_blob_, and returns the corresponding inverse
+// affine so caller can remap the decoded keypoints back to frame coords.
 void RtmPose::preprocess_one(const cv::Mat& frame_bgr,
                              const Bbox& bb,
+                             float* dst_chw,
                              cv::Mat& M_inv_out) {
     cv::Point2f center, scale;
     float aspect = static_cast<float>(opts_.input_w)
@@ -127,41 +111,34 @@ void RtmPose::preprocess_one(const cv::Mat& frame_bgr,
     cv::warpAffine(frame_bgr, warp_, M,
                    cv::Size(opts_.input_w, opts_.input_h),
                    cv::INTER_LINEAR);
-
-    // BGR ImageNet normalization with per-channel mean/std, done inline so
-    // we don't depend on OpenCV's per-channel broadcast quirks.
     warp_.convertTo(warp_f_, CV_32FC3);
+
+    // Per-pixel normalize and split into CHW BGR (channel-major).
     int H = warp_f_.rows;
     int W = warp_f_.cols;
     int npx = H * W;
-    float* p = warp_f_.ptr<float>();
+    const float* src = warp_f_.ptr<float>();
+    float* ch_b = dst_chw + 0 * npx;
+    float* ch_g = dst_chw + 1 * npx;
+    float* ch_r = dst_chw + 2 * npx;
     for (int i = 0; i < npx; ++i) {
-        p[i * 3 + 0] = (p[i * 3 + 0] - kMeanB) / kStdB;
-        p[i * 3 + 1] = (p[i * 3 + 1] - kMeanG) / kStdG;
-        p[i * 3 + 2] = (p[i * 3 + 2] - kMeanR) / kStdR;
+        float b = src[i * 3 + 0];
+        float g = src[i * 3 + 1];
+        float r = src[i * 3 + 2];
+        ch_b[i] = (b - kMeanB) / kStdB;
+        ch_g[i] = (g - kMeanG) / kStdG;
+        ch_r[i] = (r - kMeanR) / kStdR;
     }
 
-    hwc_float_to_chw(warp_f_, input_blob_);
     M_inv_out = warp_matrix(center, scale, opts_.input_w, opts_.input_h, true);
 }
 
-std::vector<Person> RtmPose::infer(const cv::Mat& frame_bgr,
-                                   const std::vector<Bbox>& bboxes) {
-    std::vector<Person> out;
-    out.reserve(bboxes.size());
-    if (bboxes.empty()) return out;
+void RtmPose::run_one_batch(const Request* reqs,
+                            std::size_t n,
+                            std::vector<Person>& out) {
+    if (n == 0) return;
 
-    // Phase 1: batch=1 per bbox. Phase 3 batches.
-    nvinfer1::Dims in_dims;
-    in_dims.nbDims = 4;
-    in_dims.d[0] = 1;
-    in_dims.d[1] = 3;
-    in_dims.d[2] = opts_.input_h;
-    in_dims.d[3] = opts_.input_w;
-    engine_.set_input_shape(opts_.input_name, in_dims);
-
-    // Engine-declared output shapes: (-1, 17, Wx) and (-1, 17, Wy). The K
-    // and W dims are static, batch is dynamic and now resolves to 1.
+    // Engine-declared output shapes: (-1, K, Wx) and (-1, K, Wy).
     auto eng_sx = engine_.engine().getTensorShape(opts_.simcc_x_name.c_str());
     auto eng_sy = engine_.engine().getTensorShape(opts_.simcc_y_name.c_str());
     if (eng_sx.nbDims != 3 || eng_sy.nbDims != 3
@@ -171,56 +148,97 @@ std::vector<Person> RtmPose::infer(const cv::Mat& frame_bgr,
     }
     int Wx = eng_sx.d[2];
     int Wy = eng_sy.d[2];
-    simcc_x_host_.resize(static_cast<std::size_t>(kNumKeypoints) * Wx);
-    simcc_y_host_.resize(static_cast<std::size_t>(kNumKeypoints) * Wy);
 
-    for (const auto& bb : bboxes) {
-        cv::Mat M_inv;
-        preprocess_one(frame_bgr, bb, M_inv);
+    int H = opts_.input_h;
+    int W = opts_.input_w;
+    std::size_t per_item = static_cast<std::size_t>(3) * H * W;
+    input_blob_.resize(per_item * n);
+    simcc_x_host_.resize(static_cast<std::size_t>(n) * kNumKeypoints * Wx);
+    simcc_y_host_.resize(static_cast<std::size_t>(n) * kNumKeypoints * Wy);
 
-        const std::size_t in_bytes = input_blob_.size() * sizeof(float);
-        engine_.copy_input_from_host(opts_.input_name, input_blob_.data(), in_bytes);
-        engine_.enqueue();
-        engine_.copy_output_to_host(opts_.simcc_x_name,
-                                    simcc_x_host_.data(),
-                                    simcc_x_host_.size() * sizeof(float));
-        engine_.copy_output_to_host(opts_.simcc_y_name,
-                                    simcc_y_host_.data(),
-                                    simcc_y_host_.size() * sizeof(float));
-        engine_.synchronize();
+    // Preprocess all items into the batched blob.
+    std::vector<cv::Mat> M_invs(n);
+    for (std::size_t i = 0; i < n; ++i) {
+        preprocess_one(*reqs[i].frame, reqs[i].bbox,
+                       input_blob_.data() + i * per_item,
+                       M_invs[i]);
+    }
 
+    // Set dynamic batch dim and run.
+    nvinfer1::Dims in_dims;
+    in_dims.nbDims = 4;
+    in_dims.d[0] = static_cast<int>(n);
+    in_dims.d[1] = 3;
+    in_dims.d[2] = H;
+    in_dims.d[3] = W;
+    engine_.set_input_shape(opts_.input_name, in_dims);
+
+    engine_.copy_input_from_host(opts_.input_name,
+                                 input_blob_.data(),
+                                 input_blob_.size() * sizeof(float));
+    engine_.enqueue();
+    engine_.copy_output_to_host(opts_.simcc_x_name,
+                                simcc_x_host_.data(),
+                                simcc_x_host_.size() * sizeof(float));
+    engine_.copy_output_to_host(opts_.simcc_y_name,
+                                simcc_y_host_.data(),
+                                simcc_y_host_.size() * sizeof(float));
+    engine_.synchronize();
+
+    // Decode each batch item.
+    const std::size_t stride_x = static_cast<std::size_t>(kNumKeypoints) * Wx;
+    const std::size_t stride_y = static_cast<std::size_t>(kNumKeypoints) * Wy;
+    for (std::size_t i = 0; i < n; ++i) {
         Person p{};
-        p.bbox = bb;
+        p.bbox = reqs[i].bbox;
+        const float* base_x = simcc_x_host_.data() + i * stride_x;
+        const float* base_y = simcc_y_host_.data() + i * stride_y;
         for (std::size_t k = 0; k < kNumKeypoints; ++k) {
-            const float* row_x = simcc_x_host_.data() + k * Wx;
-            const float* row_y = simcc_y_host_.data() + k * Wy;
-
-            // argmax + max for x and y independently
+            const float* row_x = base_x + k * Wx;
+            const float* row_y = base_y + k * Wy;
             int   x_arg = 0;
             float x_max = row_x[0];
-            for (int i = 1; i < Wx; ++i) {
-                if (row_x[i] > x_max) { x_max = row_x[i]; x_arg = i; }
+            for (int j = 1; j < Wx; ++j) {
+                if (row_x[j] > x_max) { x_max = row_x[j]; x_arg = j; }
             }
             int   y_arg = 0;
             float y_max = row_y[0];
-            for (int i = 1; i < Wy; ++i) {
-                if (row_y[i] > y_max) { y_max = row_y[i]; y_arg = i; }
+            for (int j = 1; j < Wy; ++j) {
+                if (row_y[j] > y_max) { y_max = row_y[j]; y_arg = j; }
             }
-
             float score = std::min(x_max, y_max);
             if (score < 0.0f) score = 0.0f;
-
-            // (x, y) in 256x192 input frame coords (divide by simcc_split=2)
             p.kpts[k].x = static_cast<float>(x_arg) / opts_.simcc_split;
             p.kpts[k].y = static_cast<float>(y_arg) / opts_.simcc_split;
             p.kpts[k].score = score;
         }
-
-        apply_affine_inplace(M_inv, p.kpts);
+        apply_affine_inplace(M_invs[i], p.kpts);
         out.push_back(p);
     }
+}
 
+std::vector<Person> RtmPose::infer_batch(const std::vector<Request>& reqs) {
+    std::vector<Person> out;
+    out.reserve(reqs.size());
+    if (reqs.empty()) return out;
+
+    const std::size_t max_b = static_cast<std::size_t>(std::max(1, opts_.max_batch));
+    for (std::size_t i = 0; i < reqs.size(); i += max_b) {
+        std::size_t n = std::min(max_b, reqs.size() - i);
+        run_one_batch(reqs.data() + i, n, out);
+    }
     return out;
+}
+
+std::vector<Person> RtmPose::infer(const cv::Mat& frame_bgr,
+                                   const std::vector<Bbox>& bboxes) {
+    if (bboxes.empty()) return {};
+    std::vector<Request> reqs;
+    reqs.reserve(bboxes.size());
+    for (const auto& b : bboxes) {
+        reqs.push_back(Request{&frame_bgr, b});
+    }
+    return infer_batch(reqs);
 }
 
 }  // namespace fitra::infer

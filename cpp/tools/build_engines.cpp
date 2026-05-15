@@ -161,7 +161,10 @@ int main(int argc, char** argv) {
         fitra::infer::DynamicProfile p;
         p.input_name = "input";
         p.min_dims   = parse_dims("1x3x256x192");
-        p.opt_dims   = parse_dims("1x3x256x192");
+        // opt=3 matches the 3-camera target (one bbox per cam in single-
+        // person mode). TRT picks kernels best for `opt`, so opt=1 leaves
+        // multi-cam throughput on the table.
+        p.opt_dims   = parse_dims("3x3x256x192");
         p.max_dims   = parse_dims("3x3x256x192");
         opts.profiles.push_back(std::move(p));
     } else if (preset == "yolox") {
