@@ -39,13 +39,27 @@ void MultiCameraDriver::stop() {
 }
 
 void MultiCameraDriver::loop() {
+    // Per-iteration scratch (lives across loops to avoid reallocation).
+    struct PendingCam {
+        std::size_t                          idx;
+        camera::Frame                        raw;
+        std::chrono::steady_clock::time_point captured_at;
+        std::size_t                          person_offset;  // into batched persons
+        std::size_t                          person_count;
+    };
+    std::vector<PendingCam>          pending;
+    std::vector<infer::RtmPose::Request> reqs;
+
     while (!stop_.load()) {
-        bool any_work = false;
+        pending.clear();
+        reqs.clear();
+
+        // Pass 1: capture + decode + (cached) bbox per camera. YOLOX is
+        // serialized but RTMPose accumulates into one batch.
         for (std::size_t i = 0; i < caps_.size(); ++i) {
             if (stop_.load()) break;
             camera::Frame raw;
             if (!caps_[i]->try_pop_latest(raw)) continue;
-            any_work = true;
 
             auto& cs = per_cam_[i];
             if (!cs.decoder.decode(raw.jpeg, cs.frame)) {
@@ -71,37 +85,61 @@ void MultiCameraDriver::loop() {
                 }
                 cs.cached_bboxes = std::move(dets);
             }
-            auto persons = rtmpose_.infer(cs.frame, cs.cached_bboxes);
 
-            auto now = std::chrono::steady_clock::now();
+            PendingCam pc;
+            pc.idx          = i;
+            pc.raw          = std::move(raw);
+            pc.captured_at  = pc.raw.captured_at;
+            pc.person_offset = reqs.size();
+            pc.person_count  = cs.cached_bboxes.size();
+            for (const auto& bb : cs.cached_bboxes) {
+                reqs.push_back(infer::RtmPose::Request{&cs.frame, bb});
+            }
+            pending.push_back(std::move(pc));
+        }
+
+        if (pending.empty()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            continue;
+        }
+
+        // Pass 2: one batched RTMPose call (or 0 if nobody had a person).
+        std::vector<infer::Person> all_persons;
+        if (!reqs.empty()) {
+            all_persons = rtmpose_.infer_batch(reqs);
+        }
+
+        // Pass 3: distribute persons back to per-camera snapshots and update stats.
+        auto wall_now = std::chrono::system_clock::now();
+        auto now      = std::chrono::steady_clock::now();
+        for (const auto& pc : pending) {
+            auto& cs = per_cam_[pc.idx];
             ++cs.frame_idx;
-            update_stats(cs, now, raw.captured_at);
+            update_stats(cs, now, pc.captured_at);
 
             CameraSnapshot snap;
-            snap.id = static_cast<int>(i);
-            snap.w  = caps_[i]->options().width;
-            snap.h  = caps_[i]->options().height;
-            snap.seq = raw.seq;
-            snap.captured_at = raw.captured_at;
-            // Approximate wall time by mapping monotonic now->wall, then
-            // subtracting the latency from raw.captured_at.
-            auto wall_now = std::chrono::system_clock::now();
+            snap.id  = static_cast<int>(pc.idx);
+            snap.w   = caps_[pc.idx]->options().width;
+            snap.h   = caps_[pc.idx]->options().height;
+            snap.seq = pc.raw.seq;
+            snap.captured_at = pc.captured_at;
             auto lag = std::chrono::duration_cast<std::chrono::milliseconds>(
-                          now - raw.captured_at);
+                          now - pc.captured_at);
             snap.captured_wall = wall_now - lag;
-            snap.persons       = std::move(persons);
-            snap.bboxes        = cs.cached_bboxes;
-            snap.recv_fps        = caps_[i]->recv_fps();
+            if (pc.person_count > 0) {
+                snap.persons.assign(
+                    all_persons.begin() + pc.person_offset,
+                    all_persons.begin() + pc.person_offset + pc.person_count);
+            }
+            snap.bboxes          = cs.cached_bboxes;
+            snap.recv_fps        = caps_[pc.idx]->recv_fps();
             snap.recent_pose_fps = cs.stats.recent_pose_fps;
             snap.avg_pose_fps    = cs.stats.avg_pose_fps;
             snap.processed       = cs.stats.processed_count;
-            std::uint64_t recv = caps_[i]->total_received();
+            std::uint64_t recv = caps_[pc.idx]->total_received();
             snap.pending         = recv > snap.processed ? recv - snap.processed : 0;
             snap.stage_ms        = cs.stats.last_stage_ms;
             bus_.update(snap);
-        }
-        if (!any_work) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(2));
         }
     }
 }
