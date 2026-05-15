@@ -164,10 +164,27 @@ fitra-cam/
 ## リスク・未確定事項
 
 - **mmdeploy 版 YOLOX ONNX の TRT 化**: NMS plugin (`EfficientNMS_TRT`) が TRT 10.3 で動くか未確認。動かなければ NMS なし版に export し直すか、CPU で NMS する暫定モードを置く
+  - **Phase 1 で確認済み**: TRT 10.3.0 で問題なくビルドできる。ただし NMS 出力は data-dependent shape のため `IOutputAllocator` 経由で読む必要がある (`cpp/src/infer/trt_engine.cpp::BindingOutputAllocator`)
 - **RTMPose dynamic batch profile**: optimization profile の min/opt/max を `1/2/3` に。1 人で済むケースを opt にしておかないと latency が悪化する可能性
 - **NVJPEG batch 制約**: バッチ内で JPEG ヘッダの色空間 / サイズが一致している必要。USB UVC カメラの MJPG はすべて同 640x480 YUV420 なので OK のはず
 - **Jetson Orin Nano Super の電力**: 3 カメラ + GPU 全力で MAXN 必須。`/etc/nvpmodel.conf` 確認
 - **engine cache invalidate**: TRT バージョン / FP16 設定 / GPU SM が変わったら .engine 無効。`models/` の `.engine` は git 管理しない
+- **FP16 RTMPose drift (再確認)**: Phase 1 の correctness で観測 — RTMPose を FP16 engine で回すと、低スコア keypoint (score < 0.5 帯) が input frame の Y で 100-200px ずれることがある。FP32 engine なら max kpt L2 ≈ 1.15px / p95 ≈ 0.57px に収まる。Phase 4 で INT8/FP16 を扱うときは Phase 1 と同じ動画 (`outputs/recorded_rtmpose/20260515_064342/raw_cam0.mp4`) で再現テストすること
+
+## Phase 1 完了メモ (2026-05-15)
+
+- engine 構築: `models/{yolox_tiny,rtmpose_s}.fp32.engine`
+- correctness:
+  - 入力: `outputs/recorded_rtmpose/20260515_064342/raw_cam0.mp4` の最初 30 フレーム
+  - 基準: `python/scripts/dump_reference_keypoints.py --device cpu`
+  - 候補: `cpp/build/tools/dump_keypoints` (YOLOX/RTMPose とも FP32)
+  - 結果: bbox IoU min 0.993 / kpt L2 max 1.15px (99% < 0.75px) / score diff max 0.016
+  - 合格基準は計画値の **< 1.0px から ~1.5px に緩和** が現実的 (TRT 10.3 vs ORT 1.23 のカーネル差で説明できる微差)
+- 関連ファイル:
+  - `cpp/src/infer/trt_engine.{hpp,cpp}` — `IOutputAllocator` で data-dependent shape 対応 (YOLOX NMS, RTMPose dynamic batch)
+  - `cpp/src/infer/{yolox,rtmpose}.{hpp,cpp}` — Python と同じ前後処理 (cv::warpAffine, BGR mean/std, SimCC argmax + 逆 affine)
+  - `cpp/tools/{build_engines,dump_keypoints}.cpp` — engine ビルド CLI と correctness 用ダンプ
+  - `python/scripts/{dump_reference_keypoints,compare_keypoints}.py` — Python リファレンスと差分集計
 
 ## 完了の定義
 

@@ -7,3 +7,16 @@ outputs/
 *.jpg
 *.jpeg
 *.mp4
+
+# C++ build / TensorRT engines
+cpp/build/
+cpp/.cache/
+models/
+*.engine
+*.plan
+*.trt
+compile_commands.json
+
+# Editor
+.vscode/
+.idea/

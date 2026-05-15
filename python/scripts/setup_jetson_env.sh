@@ -5,14 +5,17 @@
 #   - onnxruntime-gpu is either already present, or will be installed
 #     manually from Jetson AI Lab when the user wants GPU execution
 #
-# Run from the repo root:
-#   chmod +x scripts/setup_jetson_env.sh
-#   ./scripts/setup_jetson_env.sh
+# Run from anywhere:
+#   chmod +x python/scripts/setup_jetson_env.sh
+#   ./python/scripts/setup_jetson_env.sh
+#
+# The .venv is created at python/.venv (alongside requirements-jetson.txt),
+# not at the top of the repo, because the C++ migration owns the repo root.
 
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$REPO_ROOT"
+PY_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$PY_ROOT"
 
 if [[ ! -d ".venv" ]]; then
   echo "[setup] creating .venv with --system-site-packages"
