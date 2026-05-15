@@ -171,6 +171,32 @@ fitra-cam/
 - **engine cache invalidate**: TRT バージョン / FP16 設定 / GPU SM が変わったら .engine 無効。`models/` の `.engine` は git 管理しない
 - **FP16 RTMPose drift (再確認)**: Phase 1 の correctness で観測 — RTMPose を FP16 engine で回すと、低スコア keypoint (score < 0.5 帯) が input frame の Y で 100-200px ずれることがある。FP32 engine なら max kpt L2 ≈ 1.15px / p95 ≈ 0.57px に収まる。Phase 4 で INT8/FP16 を扱うときは Phase 1 と同じ動画 (`outputs/recorded_rtmpose/20260515_064342/raw_cam0.mp4`) で再現テストすること
 
+## Phase 3 完了メモ (2026-05-15)
+
+- 構成:
+  - `cpp/src/pipeline/snapshot.{hpp,cpp}` — 全カメラ最新スナップショットを mutex 保護で保持。`make_bundle_json()` で Python 互換スキーマの JSON を生成
+  - `cpp/src/pipeline/multi_pipeline.{hpp,cpp}` — N カメラ駆動。N capture スレッド + 1 共有推論スレッド + 共有 Yolox/RtmPose (single TRT context)。round-robin で順番に処理し、SnapshotBus に書く
+  - `cpp/src/web/crow_server.{hpp,cpp}` — Crow ベース。`/` index.html、`/<path>` static、`/stats` JSON、`/ws` WebSocket。Crow デフォルトの SIGINT ハンドラを `signal_clear()` で外し、自前ハンドラから driver/server を順に閉じる
+  - `cpp/src/main.cpp` — Phase 0 の probe-only main を置き換え。`--cam0/1/2` で N カメラ起動、`--no-web` でドライバ単独動作
+  - `web/dual_rtmpose/index.html` + `app.js` — bundle.cameras 配列から動的にペインを生成 (2/3 cam どちらでも動く)
+- 動作確認 (cam0 + cam1, FP32 engine, det-frequency=10):
+  - WebSocket `/ws` で 30Hz 配信、JSON schema は Python `dual_rtmpose_web.py` 互換
+  - 各カメラ recv=30 fps / recent_pose=15.7 fps (USB 2.0 共有で 1 cam あたり 15fps 推論)
+  - pending が増え続ける (バックログ蓄積) → Phase 4 で batched RTMPose + GPU 前処理で吸収
+- 既知の課題 (Phase 4 行き):
+  - **pending 増大**: 30 fps × 2 受信 vs 15 fps × 2 処理 → 毎秒 30 フレーム遅れる (latest-frame-wins でドロップされ続けるので破綻はしない)
+  - **RTMPose B=1 ループ**: 複数人 / 複数カメラの bbox を 1 リクエストずつ enqueue している。engine は dynamic batch 1..3 でビルド済みなので、バッチ詰めで 2-3× 改善見込み
+  - **CPU JPEG decode**: Phase 2 baseline のまま。NVJPEG に置換で stage_ms 短縮 + CPU 解放
+- SIGINT で driver と Crow を順番に閉じて exit code 0。停止には Crow run() のドレインで数秒かかる
+- ベンチコマンド (live):
+  ```
+  ./cpp/build/main --cam0 /dev/v4l/by-path/...:2.3:1.0-video-index0 \
+                   --cam1 /dev/v4l/by-path/...:2.4:1.0-video-index0 \
+                   --det-engine models/yolox_tiny.fp32.engine \
+                   --pose-engine models/rtmpose_s.fp32.engine
+  # ブラウザで http://JETSON_IP:8000/
+  ```
+
 ## Phase 2 完了メモ (2026-05-15)
 
 - 構成:

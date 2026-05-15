@@ -34,6 +34,32 @@ find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs videoio)
 # Threads
 find_package(Threads REQUIRED)
 
+# Crow (header-only HTTP/WebSocket) requires either standalone asio or
+# Boost.Asio. apt's libboost-dev on JetPack ships headers only (no
+# boost_system CMake config), so we fetch standalone asio headers and
+# expose ASIO_INCLUDE_DIR before Crow's find_package(asio).
+include(FetchContent)
+FetchContent_Declare(
+    asio
+    GIT_REPOSITORY https://github.com/chriskohlhoff/asio.git
+    GIT_TAG        asio-1-28-2
+    GIT_SHALLOW    TRUE
+)
+FetchContent_MakeAvailable(asio)
+set(ASIO_INCLUDE_DIR "${asio_SOURCE_DIR}/asio/include"
+    CACHE PATH "asio header dir (consumed by Crow's Findasio)" FORCE)
+
+set(CROW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(CROW_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
+set(CROW_INSTALL        OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(
+    Crow
+    GIT_REPOSITORY https://github.com/CrowCpp/Crow.git
+    GIT_TAG        v1.2.1.2
+    GIT_SHALLOW    TRUE
+)
+FetchContent_MakeAvailable(Crow)
+
 # -------- targets --------
 add_subdirectory(src)
 add_subdirectory(tools)
@@ -48,4 +74,5 @@ message(STATUS "  TensorRT version   = ${TensorRT_VERSION}")
 message(STATUS "  TensorRT include   = ${TensorRT_INCLUDE_DIRS}")
 message(STATUS "  TensorRT libraries = ${TensorRT_LIBRARIES}")
 message(STATUS "  OpenCV version     = ${OpenCV_VERSION}")
+message(STATUS "  Crow source dir    = ${crow_SOURCE_DIR}")
 message(STATUS "")

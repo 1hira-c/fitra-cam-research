@@ -2,25 +2,16 @@
 <html lang="ja">
 <head>
   <meta charset="utf-8">
-  <title>fitra-cam dual RTMPose</title>
+  <title>fitra-cam RTMPose</title>
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
   <header>
-    <h1>fitra-cam dual RTMPose</h1>
+    <h1>fitra-cam RTMPose</h1>
     <div id="conn" class="conn">connecting…</div>
   </header>
   <main>
-    <section class="pane" data-cam="0">
-      <h2>cam0</h2>
-      <canvas data-cam="0" width="640" height="480"></canvas>
-      <pre class="stats" data-cam="0"></pre>
-    </section>
-    <section class="pane" data-cam="1">
-      <h2>cam1</h2>
-      <canvas data-cam="1" width="640" height="480"></canvas>
-      <pre class="stats" data-cam="1"></pre>
-    </section>
+    <!-- Panes are inserted dynamically by app.js as cameras report in. -->
   </main>
   <script src="app.js"></script>
 </body>

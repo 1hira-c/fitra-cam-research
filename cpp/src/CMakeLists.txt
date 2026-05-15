@@ -35,9 +35,11 @@ target_link_libraries(fitra_camera PUBLIC
     opencv_imgcodecs
 )
 
-# Pipeline glue: capture -> decode -> YOLOX -> RTMPose.
+# Pipeline glue: single-camera helper, multi-camera driver, snapshot bus.
 add_library(fitra_pipeline STATIC
     pipeline/pose_pipeline.cpp
+    pipeline/multi_pipeline.cpp
+    pipeline/snapshot.cpp
 )
 
 target_link_libraries(fitra_pipeline PUBLIC
@@ -45,14 +47,24 @@ target_link_libraries(fitra_pipeline PUBLIC
     fitra_camera
 )
 
-# Top-level `main` binary (Phase 0 probe; will be replaced by the
-# full pipeline driver in a later phase).
+# Crow HTTP+WebSocket server.
+add_library(fitra_web STATIC
+    web/crow_server.cpp
+)
+
+target_link_libraries(fitra_web PUBLIC
+    fitra_pipeline
+    Crow::Crow
+)
+
+# Top-level driver: N cameras -> shared TRT -> Crow web.
 add_executable(fitra_cam_main
     main.cpp
 )
 
 target_link_libraries(fitra_cam_main PRIVATE
-    fitra_infer
+    fitra_pipeline
+    fitra_web
 )
 
 set_target_properties(fitra_cam_main PROPERTIES

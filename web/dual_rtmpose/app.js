@@ -1,6 +1,6 @@
 "use strict";
 
-const CAM_COLORS = ["#00dc00", "#ffb400"];
+const CAM_COLORS = ["#00dc00", "#ffb400", "#48aaff", "#ff6f6f"];
 const KP_THR = 0.3;
 const SKELETON = [
   [0, 1], [0, 2], [1, 3], [2, 4],
@@ -9,23 +9,57 @@ const SKELETON = [
   [11, 13], [13, 15], [12, 14], [14, 16],
 ];
 
+const main = document.querySelector("main");
+const conn = document.getElementById("conn");
+
 const state = {
-  bundles: [null, null],  // latest per-camera bundle (mirrored from server seq)
-  renderFps: [0, 0],
-  renderTimes: [[], []],
+  // per-camera latest snapshot (sparse — keyed by camera id)
+  bundles: {},
+  // per-camera render fps state
+  renderTimes: {},
+  renderFps: {},
+  panes: {},          // { camId: { canvas, stats } }
   serverSeq: 0,
   serverLastMs: 0,
 };
 
-const canvases = Array.from(document.querySelectorAll("canvas")).reduce((acc, el) => {
-  acc[Number(el.dataset.cam)] = el;
-  return acc;
-}, {});
-const statsEls = Array.from(document.querySelectorAll(".stats")).reduce((acc, el) => {
-  acc[Number(el.dataset.cam)] = el;
-  return acc;
-}, {});
-const conn = document.getElementById("conn");
+// Build (or reuse) the pane for a given camera id.
+function ensurePane(camId) {
+  if (state.panes[camId]) return state.panes[camId];
+
+  const section = document.createElement("section");
+  section.className = "pane";
+  section.dataset.cam = String(camId);
+  const h2 = document.createElement("h2");
+  h2.textContent = `cam${camId}`;
+  const canvas = document.createElement("canvas");
+  canvas.dataset.cam = String(camId);
+  canvas.width = 640;
+  canvas.height = 480;
+  const stats = document.createElement("pre");
+  stats.className = "stats";
+  stats.dataset.cam = String(camId);
+  stats.textContent = "waiting…";
+  section.appendChild(h2);
+  section.appendChild(canvas);
+  section.appendChild(stats);
+
+  // Insert sorted by cam id
+  let inserted = false;
+  for (const sib of main.querySelectorAll("section.pane")) {
+    if (Number(sib.dataset.cam) > camId) {
+      main.insertBefore(section, sib);
+      inserted = true;
+      break;
+    }
+  }
+  if (!inserted) main.appendChild(section);
+
+  state.panes[camId] = { canvas, stats };
+  state.renderTimes[camId] = [];
+  state.renderFps[camId] = 0;
+  return state.panes[camId];
+}
 
 function connect() {
   const wsProto = location.protocol === "https:" ? "wss" : "ws";
@@ -33,11 +67,8 @@ function connect() {
   ws.onopen = () => {
     conn.textContent = "live";
     conn.className = "conn live";
-    // Keep server-side receive_text alive
     setInterval(() => {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send("ping");
-      }
+      if (ws.readyState === WebSocket.OPEN) ws.send("ping");
     }, 5000);
   };
   ws.onclose = () => {
@@ -58,15 +89,17 @@ function connect() {
     }
     state.serverSeq = bundle.seq;
     state.serverLastMs = bundle.ts_ms;
-    for (const cam of bundle.cameras) {
+    for (const cam of bundle.cameras || []) {
+      ensurePane(cam.id);
       state.bundles[cam.id] = cam;
     }
   };
 }
 
 function drawCamera(camId) {
-  const canvas = canvases[camId];
-  if (!canvas) return;
+  const pane = state.panes[camId];
+  if (!pane) return;
+  const canvas = pane.canvas;
   const bundle = state.bundles[camId];
   const ctx = canvas.getContext("2d");
   ctx.fillStyle = "#000";
@@ -113,9 +146,10 @@ function drawCamera(camId) {
 }
 
 function updateStats(camId) {
+  const pane = state.panes[camId];
+  if (!pane) return;
+  const el = pane.stats;
   const bundle = state.bundles[camId];
-  const el = statsEls[camId];
-  if (!el) return;
   if (!bundle) {
     el.textContent = "waiting…";
     return;
@@ -139,7 +173,8 @@ function updateStats(camId) {
 
 function renderTick() {
   const now = performance.now();
-  for (const camId of [0, 1]) {
+  for (const camIdStr of Object.keys(state.panes)) {
+    const camId = Number(camIdStr);
     drawCamera(camId);
     const times = state.renderTimes[camId];
     times.push(now);
