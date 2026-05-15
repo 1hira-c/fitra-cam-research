@@ -29,3 +29,19 @@ set_target_properties(fitra_dump_keypoints PROPERTIES
     OUTPUT_NAME "dump_keypoints"
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools"
 )
+
+# Phase 2: single-camera live benchmark.
+add_executable(fitra_pose_bench
+    pose_bench.cpp
+)
+
+target_link_libraries(fitra_pose_bench PRIVATE
+    fitra_pipeline
+    opencv_imgcodecs
+    opencv_imgproc
+)
+
+set_target_properties(fitra_pose_bench PROPERTIES
+    OUTPUT_NAME "pose_bench"
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools"
+)

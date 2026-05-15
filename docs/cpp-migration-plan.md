@@ -171,6 +171,25 @@ fitra-cam/
 - **engine cache invalidate**: TRT バージョン / FP16 設定 / GPU SM が変わったら .engine 無効。`models/` の `.engine` は git 管理しない
 - **FP16 RTMPose drift (再確認)**: Phase 1 の correctness で観測 — RTMPose を FP16 engine で回すと、低スコア keypoint (score < 0.5 帯) が input frame の Y で 100-200px ずれることがある。FP32 engine なら max kpt L2 ≈ 1.15px / p95 ≈ 0.57px に収まる。Phase 4 で INT8/FP16 を扱うときは Phase 1 と同じ動画 (`outputs/recorded_rtmpose/20260515_064342/raw_cam0.mp4`) で再現テストすること
 
+## Phase 2 完了メモ (2026-05-15)
+
+- 構成:
+  - `cpp/src/camera/v4l2_capture.{hpp,cpp}` — V4L2 MJPEG 直叩き (ioctl + mmap)、4 buffer ring、latest-frame-wins
+  - `cpp/src/camera/jpeg_decoder.{hpp,cpp}` — Phase 2 は `cv::imdecode` (CPU)。Phase 4 で Jetson MM API libnvjpeg に差し替え
+  - `cpp/src/pipeline/pose_pipeline.{hpp,cpp}` — 1 カメラの capture → decode → YOLOX → RTMPose
+  - `cpp/tools/pose_bench` — ライブカメラベンチ
+- ライブカメラ動作 (cam0 単独, `--det-frequency 10`, FP32 engine):
+  - recv=30.04 fps / avg_pose=28.92 / recent_pose=29.97 / stage_ms=32 / pending≈3
+  - カメラの 30fps 上限に張り付く (パイプライン側に余裕あり)
+- ベンチ (raw_cam0.mp4, 200 フレーム, `--det-frequency 1`):
+  - Python ORT-CUDA: 15.57 fps
+  - C++ TRT FP32:    23.49 fps  (**1.51× vs Python**, Phase 2 目標達成)
+  - C++ TRT FP16:    31.19 fps  (Phase 4 でドリフト解決後の上限値、参考)
+- 残課題 (Phase 4 で対応):
+  - JPEG decode が CPU 経路 (`cv::imdecode`)。GPU NVJPEG にすると stage_ms 短縮 + CPU 開放
+  - 1 カメラだと recv=30fps が天井。3 カメラ aggregate ≥ 90fps が Phase 4 ゴール
+  - FP16 RTMPose drift (Phase 1 既知) を INT8 PTQ / 入力 cast で吸収する
+
 ## Phase 1 完了メモ (2026-05-15)
 
 - engine 構築: `models/{yolox_tiny,rtmpose_s}.fp32.engine`
