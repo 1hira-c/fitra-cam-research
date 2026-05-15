@@ -77,6 +77,7 @@ void print_help() {
         "  --fps N                   requested capture fps (default 30)\n"
         "  --det-frequency N         run YOLOX every N frames (default 10)\n"
         "  --multi-person            process all bboxes per camera (default: largest only)\n"
+        "  --bench-fake-bbox         inject synthetic bbox when detections are empty (bench only)\n"
         "  --det-score F             detection score threshold (default 0.5)\n"
         "  --log-every-s F           stats interval in seconds (default 2.0)\n"
         "  --probe                   Phase 0 sanity check and exit\n"
@@ -127,6 +128,7 @@ int main(int argc, char** argv) {
     int   width = 640, height = 480, fps = 30;
     int   det_frequency = 10;
     bool  multi_person = false;
+    bool  bench_fake_bbox = false;
     float det_score = 0.5f;
     double log_every_s = 2.0;
     bool  want_probe = false;
@@ -156,6 +158,7 @@ int main(int argc, char** argv) {
         else if (a == "--fps")               { fps    = std::atoi(need("--fps")); }
         else if (a == "--det-frequency")     { det_frequency = std::atoi(need("--det-frequency")); }
         else if (a == "--multi-person")      { multi_person  = true; }
+        else if (a == "--bench-fake-bbox")   { bench_fake_bbox = true; }
         else if (a == "--det-score")         { det_score = std::stof(need("--det-score")); }
         else if (a == "--log-every-s")       { log_every_s = std::stod(need("--log-every-s")); }
         else {
@@ -208,8 +211,12 @@ int main(int argc, char** argv) {
             fitra::camera::FrameSource::Options src_opts;
             src_opts.det_frequency = det_frequency;
             src_opts.single_person = !multi_person;
+            src_opts.fake_bbox_if_empty = bench_fake_bbox;
+            // Have the per-camera worker pre-bake the RTMPose input so the
+            // central inference thread only does memcpy + GPU + decode.
+            const auto& rtmpose_opts = rtmpose.options();
             sources.push_back(std::make_unique<fitra::camera::FrameSource>(
-                std::move(cap), std::move(yolox), src_opts));
+                std::move(cap), std::move(yolox), src_opts, &rtmpose_opts));
         }
         std::size_t n_cams = sources.size();
 
@@ -239,11 +246,13 @@ int main(int argc, char** argv) {
                     const auto& s = driver.stats_for(i);
                     char buf[256];
                     std::snprintf(buf, sizeof(buf),
-                                  "cam%zu: avg_pose=%.2f recent_pose=%.2f "
-                                  "stage_ms=%.1f processed=%llu",
-                                  i, s.avg_pose_fps, s.recent_pose_fps,
+                                  "cam%zu: recv=%5.2f avg_pose=%5.2f recent_pose=%5.2f "
+                                  "stage_ms=%6.1f processed=%llu pending=%llu",
+                                  i, driver.recv_fps_for(i),
+                                  s.avg_pose_fps, s.recent_pose_fps,
                                   s.last_stage_ms,
-                                  static_cast<unsigned long long>(s.processed_count));
+                                  static_cast<unsigned long long>(s.processed_count),
+                                  static_cast<unsigned long long>(driver.pending_for(i)));
                     FITRA_LOG_INFO("{}", buf);
                 }
                 last_log = now;

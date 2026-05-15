@@ -7,6 +7,16 @@
 //
 // Pair with python/scripts/compare_keypoints.py to compute bbox IoU and
 // keypoint L2 statistics against the Python reference.
+//
+// Two RTMPose code paths:
+//   - default: rtmpose.infer(frame, bboxes)  (internal preprocess)
+//   - --prebaked: preprocess_to_blob + infer_prebaked(), mirrors the
+//     Phase 6b live-pipeline path. Use this to verify the fast path is
+//     numerically equivalent on a recorded MP4.
+//
+// --overlay PATH also writes an MP4 with skeleton drawn on each frame so
+// a human can sanity-check the result visually (the Phase 6 PR demands
+// this; raw fps numbers say nothing about whether bboxes/kpts make sense).
 
 #include <algorithm>
 #include <chrono>
@@ -21,6 +31,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include <NvInfer.h>
@@ -64,14 +75,50 @@ void print_help() {
         "  --max-frames N            stop after N frames (default 0 = whole video)\n"
         "  --det-score F             detection score threshold (default 0.5)\n"
         "  --multi-person            run pose on all bboxes (default: largest only)\n"
+        "  --prebaked                use Phase 6b infer_prebaked() path\n"
+        "                             (preprocess_to_blob + infer_prebaked)\n"
+        "  --overlay PATH            also write an overlay MP4 with skeleton drawn\n"
         "  --help                    show this help\n");
 }
 
 std::string fmt_float(float v) {
-    // Format with enough digits to round-trip without padding zeros.
     char buf[32];
     std::snprintf(buf, sizeof(buf), "%.6g", static_cast<double>(v));
     return buf;
+}
+
+// COCO 17-keypoint skeleton (same edges as python/scripts/pose_pipeline.py).
+constexpr std::pair<int, int> kSkel[] = {
+    {0, 1}, {0, 2}, {1, 3}, {2, 4},
+    {5, 7}, {7, 9}, {6, 8}, {8, 10},
+    {5, 6}, {5, 11}, {6, 12}, {11, 12},
+    {11, 13}, {13, 15}, {12, 14}, {14, 16},
+};
+
+void draw_overlay(cv::Mat& frame,
+                  const std::vector<fitra::infer::Person>& persons,
+                  float kp_thr = 0.3f) {
+    const cv::Scalar color(0, 220, 0);
+    for (const auto& p : persons) {
+        cv::rectangle(frame,
+                      {static_cast<int>(p.bbox.x1), static_cast<int>(p.bbox.y1)},
+                      {static_cast<int>(p.bbox.x2), static_cast<int>(p.bbox.y2)},
+                      cv::Scalar(80, 80, 80), 1, cv::LINE_AA);
+        for (auto [a, b] : kSkel) {
+            const auto& ka = p.kpts[static_cast<std::size_t>(a)];
+            const auto& kb = p.kpts[static_cast<std::size_t>(b)];
+            if (ka.score < kp_thr || kb.score < kp_thr) continue;
+            cv::line(frame,
+                     {static_cast<int>(ka.x), static_cast<int>(ka.y)},
+                     {static_cast<int>(kb.x), static_cast<int>(kb.y)},
+                     color, 2, cv::LINE_AA);
+        }
+        for (const auto& kp : p.kpts) {
+            if (kp.score < kp_thr) continue;
+            cv::circle(frame, {static_cast<int>(kp.x), static_cast<int>(kp.y)},
+                       3, color, -1, cv::LINE_AA);
+        }
+    }
 }
 
 }  // namespace
@@ -81,9 +128,11 @@ int main(int argc, char** argv) {
     std::string det_engine;
     std::string pose_engine;
     std::string output;
+    std::string overlay_path;
     int   max_frames = 0;
     float det_score  = 0.5f;
     bool  multi_person = false;
+    bool  use_prebaked = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string_view a{argv[i]};
@@ -102,6 +151,8 @@ int main(int argc, char** argv) {
         else if (a == "--max-frames")   { max_frames  = std::atoi(need_arg("--max-frames")); }
         else if (a == "--det-score")    { det_score   = std::stof(need_arg("--det-score")); }
         else if (a == "--multi-person") { multi_person = true; }
+        else if (a == "--prebaked")     { use_prebaked = true; }
+        else if (a == "--overlay")      { overlay_path = need_arg("--overlay"); }
         else {
             std::fprintf(stderr, "unknown arg: %s\n", argv[i]);
             print_help();
@@ -127,6 +178,8 @@ int main(int argc, char** argv) {
         yolo_opts.score_thr = det_score;
         fitra::infer::Yolox yolox{*yolox_engine, yolo_opts};
         fitra::infer::RtmPose rtmpose{*rtmpose_engine};
+        const auto& rtmpose_opts = rtmpose.options();
+        const std::size_t per_item = fitra::infer::RtmPose::blob_floats_per_item(rtmpose_opts);
 
         cv::VideoCapture cap{video};
         if (!cap.isOpened()) {
@@ -134,7 +187,14 @@ int main(int argc, char** argv) {
             return EXIT_FAILURE;
         }
         int total = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_COUNT));
-        FITRA_LOG_INFO("video: {} frames", total);
+        double src_fps = cap.get(cv::CAP_PROP_FPS);
+        if (src_fps <= 0) src_fps = 30.0;
+        int src_w = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_WIDTH));
+        int src_h = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_HEIGHT));
+        char src_meta[80];
+        std::snprintf(src_meta, sizeof(src_meta),
+                      "%d frames %dx%d @ %.2f fps", total, src_w, src_h, src_fps);
+        FITRA_LOG_INFO("video: {}", src_meta);
 
         std::filesystem::path outp{output};
         if (outp.has_parent_path()) {
@@ -145,6 +205,28 @@ int main(int argc, char** argv) {
             FITRA_LOG_ERROR("failed to open {}", output);
             return EXIT_FAILURE;
         }
+
+        std::unique_ptr<cv::VideoWriter> overlay_writer;
+        if (!overlay_path.empty()) {
+            std::filesystem::path op{overlay_path};
+            if (op.has_parent_path()) {
+                std::filesystem::create_directories(op.parent_path());
+            }
+            overlay_writer = std::make_unique<cv::VideoWriter>(
+                overlay_path, cv::VideoWriter::fourcc('m', 'p', '4', 'v'),
+                src_fps, cv::Size(src_w, src_h));
+            if (!overlay_writer->isOpened()) {
+                FITRA_LOG_ERROR("failed to open overlay writer at {}", overlay_path);
+                return EXIT_FAILURE;
+            }
+            FITRA_LOG_INFO("overlay output: {} ({} mode)",
+                           overlay_path, use_prebaked ? "prebaked" : "internal");
+        }
+
+        // Scratch buffers reused across frames for the prebaked path.
+        std::vector<std::vector<float>>                chw_bufs;
+        std::vector<cv::Mat>                            M_invs;
+        std::vector<fitra::infer::RtmPose::PrebakedRequest> prereqs;
 
         cv::Mat frame;
         int     written = 0;
@@ -165,7 +247,30 @@ int main(int argc, char** argv) {
                 bboxes.clear();
                 bboxes.push_back(keep);
             }
-            auto persons = rtmpose.infer(frame, bboxes);
+
+            std::vector<fitra::infer::Person> persons;
+            if (use_prebaked) {
+                // Mirrors the Phase 6b live path: preprocess_to_blob on the
+                // caller side, then infer_prebaked.
+                chw_bufs.resize(bboxes.size());
+                M_invs.resize(bboxes.size());
+                prereqs.clear();
+                prereqs.reserve(bboxes.size());
+                for (std::size_t k = 0; k < bboxes.size(); ++k) {
+                    chw_bufs[k].resize(per_item);
+                    fitra::infer::RtmPose::preprocess_to_blob(
+                        rtmpose_opts, frame, bboxes[k],
+                        chw_bufs[k].data(), M_invs[k]);
+                    fitra::infer::RtmPose::PrebakedRequest pr;
+                    pr.chw   = chw_bufs[k].data();
+                    pr.M_inv = M_invs[k];
+                    pr.bbox  = bboxes[k];
+                    prereqs.push_back(pr);
+                }
+                persons = rtmpose.infer_prebaked(prereqs);
+            } else {
+                persons = rtmpose.infer(frame, bboxes);
+            }
 
             // emit JSON line
             std::ostringstream line;
@@ -186,6 +291,11 @@ int main(int argc, char** argv) {
             line << "]}";
             fout << line.str() << "\n";
 
+            if (overlay_writer) {
+                draw_overlay(frame, persons);
+                overlay_writer->write(frame);
+            }
+
             ++written;
             if (max_frames && written >= max_frames) break;
             if (written % 50 == 0) {
@@ -199,6 +309,10 @@ int main(int argc, char** argv) {
         std::snprintf(buf, sizeof(buf), "%.2fs (%.2f fps)",
                       secs, written / std::max(secs, 1e-9));
         FITRA_LOG_INFO("done: {} frames in {} -> {}", written, buf, output);
+        if (overlay_writer) {
+            overlay_writer->release();
+            FITRA_LOG_INFO("overlay -> {}", overlay_path);
+        }
         return EXIT_SUCCESS;
     } catch (const std::exception& e) {
         FITRA_LOG_ERROR("fatal: {}", e.what());

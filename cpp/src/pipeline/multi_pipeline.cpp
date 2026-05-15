@@ -1,6 +1,7 @@
 #include "pipeline/multi_pipeline.hpp"
 
 #include <chrono>
+#include <stdexcept>
 
 #include "util/logging.hpp"
 
@@ -14,7 +15,14 @@ MultiCameraDriver::MultiCameraDriver(
       rtmpose_{rtmpose},
       bus_{bus},
       latest_per_cam_(sources_.size()),
-      per_cam_(sources_.size()) {}
+      per_cam_(sources_.size()) {
+    for (const auto& source : sources_) {
+        if (!source || !source->prebakes_pose()) {
+            throw std::invalid_argument(
+                "MultiCameraDriver requires FrameSource with RTMPose prebaking enabled");
+        }
+    }
+}
 
 MultiCameraDriver::~MultiCameraDriver() {
     try { stop(); } catch (...) {}
@@ -40,12 +48,22 @@ void MultiCameraDriver::loop() {
         std::size_t   person_offset;
         std::size_t   person_count;
     };
-    std::vector<PendingCam>              pending;
-    std::vector<infer::RtmPose::Request> reqs;
+    std::vector<PendingCam>                       pending;
+    std::vector<infer::RtmPose::PrebakedRequest>  reqs;
+
+    // Rolling stage breakdown (debug aid; prints every ~3s of work).
+    int    iter_count = 0;
+    double sum_poll_ms = 0.0, sum_rtm_ms = 0.0, sum_snap_ms = 0.0;
+    int    sum_reqs = 0;
+    auto   stats_anchor = std::chrono::steady_clock::now();
+    std::vector<bool> warned_missing_prebake(sources_.size(), false);
+    const std::size_t rtmpose_per_item =
+        infer::RtmPose::blob_floats_per_item(rtmpose_.options());
 
     while (!stop_.load()) {
         pending.clear();
         reqs.clear();
+        auto iter_start = std::chrono::steady_clock::now();
 
         // Pass 1: pull the latest (frame, bboxes) from each FrameSource.
         // Decode + YOLOX already ran in the per-camera worker thread.
@@ -59,10 +77,27 @@ void MultiCameraDriver::loop() {
             PendingCam pc;
             pc.idx           = i;
             pc.person_offset = reqs.size();
-            pc.person_count  = latest_per_cam_[i].bboxes.size();
-            for (const auto& bb : latest_per_cam_[i].bboxes) {
-                reqs.push_back(infer::RtmPose::Request{
-                    &latest_per_cam_[i].bgr, bb});
+            pc.person_count  = 0;
+            // FrameSource has already pre-baked the RTMPose inputs.
+            const auto& cam_df = latest_per_cam_[i];
+            if (!cam_df.has_prebaked_pose_inputs(rtmpose_per_item)) {
+                if (!warned_missing_prebake[i]) {
+                    FITRA_LOG_WARN(
+                        "camera {} has {} bboxes but invalid RTMPose prebaked buffers; "
+                        "skipping pose inference for these frames",
+                        i, cam_df.bboxes.size());
+                    warned_missing_prebake[i] = true;
+                }
+                pending.push_back(pc);
+                continue;
+            }
+            pc.person_count = cam_df.bboxes.size();
+            for (std::size_t bi = 0; bi < cam_df.bboxes.size(); ++bi) {
+                infer::RtmPose::PrebakedRequest pr;
+                pr.chw   = cam_df.chw_concat.data() + bi * rtmpose_per_item;
+                pr.M_inv = cam_df.M_invs[bi];
+                pr.bbox  = cam_df.bboxes[bi];
+                reqs.push_back(pr);
             }
             pending.push_back(pc);
         }
@@ -71,12 +106,16 @@ void MultiCameraDriver::loop() {
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
             continue;
         }
+        auto t_after_poll = std::chrono::steady_clock::now();
 
         // Pass 2: one batched RTMPose call across all cameras' bboxes.
+        // Preprocess already ran on per-camera worker threads — this is
+        // just memcpy + GPU enqueue + sync + SimCC decode.
         std::vector<infer::Person> all_persons;
         if (!reqs.empty()) {
-            all_persons = rtmpose_.infer_batch(reqs);
+            all_persons = rtmpose_.infer_prebaked(reqs);
         }
+        auto t_after_rtm = std::chrono::steady_clock::now();
 
         // Pass 3: distribute + update snapshot bus.
         auto wall_now = std::chrono::system_clock::now();
@@ -109,6 +148,31 @@ void MultiCameraDriver::loop() {
             snap.pending         = recv > snap.processed ? recv - snap.processed : 0;
             snap.stage_ms        = cs.stats.last_stage_ms;
             bus_.update(snap);
+        }
+        auto t_after_snap = std::chrono::steady_clock::now();
+
+        ++iter_count;
+        sum_poll_ms += std::chrono::duration<double, std::milli>(t_after_poll  - iter_start).count();
+        sum_rtm_ms  += std::chrono::duration<double, std::milli>(t_after_rtm   - t_after_poll).count();
+        sum_snap_ms += std::chrono::duration<double, std::milli>(t_after_snap  - t_after_rtm).count();
+        sum_reqs    += static_cast<int>(reqs.size());
+
+        auto elapsed = std::chrono::duration<double>(t_after_snap - stats_anchor).count();
+        if (elapsed >= 3.0) {
+            double iter_ms = (sum_poll_ms + sum_rtm_ms + sum_snap_ms) / iter_count;
+            char buf[256];
+            std::snprintf(buf, sizeof(buf),
+                          "breakdown iter_ms=%.2f poll=%.2f rtm=%.2f (per-cam avg %.2f reqs) snap=%.2f",
+                          iter_ms,
+                          sum_poll_ms / iter_count,
+                          sum_rtm_ms  / iter_count,
+                          static_cast<double>(sum_reqs) / iter_count,
+                          sum_snap_ms / iter_count);
+            FITRA_LOG_INFO("{}", buf);
+            iter_count = 0;
+            sum_poll_ms = sum_rtm_ms = sum_snap_ms = 0.0;
+            sum_reqs = 0;
+            stats_anchor = t_after_snap;
         }
     }
 }

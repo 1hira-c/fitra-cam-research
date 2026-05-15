@@ -171,6 +171,75 @@ fitra-cam/
 - **engine cache invalidate**: TRT バージョン / FP16 設定 / GPU SM が変わったら .engine 無効。`models/` の `.engine` は git 管理しない
 - **FP16 RTMPose drift (再確認)**: Phase 1 の correctness で観測 — RTMPose を FP16 engine で回すと、低スコア keypoint (score < 0.5 帯) が input frame の Y で 100-200px ずれることがある。FP32 engine なら max kpt L2 ≈ 1.15px / p95 ≈ 0.57px に収まる。Phase 4 で INT8/FP16 を扱うときは Phase 1 と同じ動画 (`outputs/recorded_rtmpose/20260515_064342/raw_cam0.mp4`) で再現テストすること
 
+## Phase 6 着地メモ (2026-05-15)  branch `cpp-90fps-push`
+
+ELP AR0234 が MJPG VGA 90 fps を出せる (`v4l2-ctl --list-formats-ext`
+で確認済み) ので、Phase 5 までの camera-bound 60 fps を超えにいく
+フェーズ。最終 aggregate **170 fps**、Phase 3 baseline 比 **5.5×**。
+
+### 6a — 測定支援 + preprocess の小手先最適化
+
+- `--bench-fake-bbox`: YOLOX が空でも synthetic 中央 bbox を流して
+  RTMPose を毎フレーム走らせる、ベンチ専用モード。subject 不在でも
+  pipeline 上限を計測できる。
+- main.cpp の stats 行に `recv_fps` と `pending` を追加。
+- multi_pipeline::loop に per-pass timing (poll / rtm / snap) を追加して
+  3 秒ごとに `iter_ms breakdown` を吐く。
+- `RtmPose::preprocess_one`:
+  - cv::Mat::convertTo の独立パスを normalize ループに fuse
+  - warp 用 scratch を class shared (`warp_`, `warp_f_`) から function
+    local cv::Mat に変更し、thread-safe 化
+- `RtmPose::run_one_batch`: n ≥ 2 のとき std::thread で並列 preprocess。
+  item 0 は caller スレッドで実行して thread spawn 数を 1 つ節約。
+
+### 6b — preprocess を FrameSource worker thread に押し出す
+
+main thread の RTMPose stage 14 ms 中 ~7 ms が preprocess、~5.5 ms が
+GPU。preprocess を per-cam に移して main を GPU dispatch だけに減らす。
+
+- `RtmPose::preprocess_to_blob(opts, frame, bbox, dst_chw, M_inv)` を
+  static helper として公開 (scratch なし、完全 thread-safe)。
+- `RtmPose::PrebakedRequest { chw, M_inv, bbox }` + `infer_prebaked()`:
+  preprocess 済み入力を直接食う高速経路。
+- `camera::DecodedFrame` に `chw_concat` + `M_invs` を追加。FrameSource
+  decode_loop は decode → YOLOX → preprocess まで一気にやって publish。
+- `MultiCameraDriver::loop` は (chw, M_inv, bbox) を集めて
+  `rtmpose.infer_prebaked(reqs)` を 1 回呼ぶだけ。
+
+### ベンチ表 (live 2 cam, `--fps 90 --det-frequency 30 --bench-fake-bbox`, RTMPose-M FP16, YOLOX FP32)
+
+| 段階 | recv/cam | recent_pose/cam | aggregate | iter_ms | rtm_ms |
+|---|---|---|---|---|---|
+| Phase 5 baseline (--fps 30 cam-bound) | 30 | 30.0 | 60 | (n/a) | (n/a) |
+| 6a fake-bbox 開始 (preprocess on main) | 88 | 52-56 | 107 | 17.7 | 17.7 |
+| 6a + preprocess fuse | 88 | 51-56 | 107 | 17.6 | 17.6 |
+| 6a + parallel preprocess (B=2) | 88 | 65-71 | **138** | 13.7 | 13.7 |
+| **6b preprocess on per-cam worker** | 88 | **85-87** | **170** | **4.5** | **4.4** |
+
+iter_ms 17.7 → 4.5、rtm step 17.7 → 4.4。recent_pose 85 fps × 2 cam =
+aggregate 170 fps で camera-saturated (88 fps 受信ぎりぎり)。main thread
+は 220 iter/s の余力あり、3 カメラ目を足せば aggregate ~260 fps が射程。
+
+### Correctness 回帰 (raw_cam0.mp4 30 frames, RTMPose-S FP32)
+
+dump_keypoints は内部 preprocess 経路 (infer_batch) で max kpt L2 = 1.15 px。
+Phase 1 / 4 / 5 と完全一致。リファクタは数値に影響なし。
+
+Phase 6b の本番経路に近い `dump_keypoints --prebaked` でも Python CPU
+参照比は bbox IoU min = 0.9932、max kpt L2 = 1.1490 px、p95 = 0.5797 px。
+内部 preprocess 経路と同等。ただし `compare_keypoints.py` の既定閾値
+`--kpt-threshold 1.0` は max 値だけ超えるので、判定は既存経路との同等性
+確認として扱う。
+
+### 残課題 (Phase 7 候補)
+
+- 3 カメラ目の実機接続で aggregate ≥ 250 fps を確認
+- GPU 前処理 (CUDA カーネルで warpAffine + 正規化 + HWC→CHW): per-cam
+  CPU を完全に解放して decode + YOLOX に専念させる
+- INT8 PTQ で RTMPose-M / YOLOX を更に高速化
+- NEON SIMD による normalize ループ最適化 (現状 ~7 ms → <1 ms 期待)
+- USB 3.0 ハブで camera あたり 120+ fps を狙う
+
 ## Phase 5 着地メモ (2026-05-15)  branch `cpp-phase5`
 
 Phase 4 で残った最大支配 (推論スレッド側の逐次 YOLOX = ~26 ms/call)

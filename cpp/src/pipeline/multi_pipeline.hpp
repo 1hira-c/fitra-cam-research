@@ -41,6 +41,12 @@ public:
 
     std::size_t camera_count() const { return sources_.size(); }
     const PipelineStats& stats_for(std::size_t i) const { return per_cam_[i].stats; }
+    double recv_fps_for(std::size_t i) const { return sources_[i]->recv_fps(); }
+    std::uint64_t pending_for(std::size_t i) const {
+        auto recv = sources_[i]->total_received();
+        auto pr   = per_cam_[i].stats.processed_count;
+        return recv > pr ? recv - pr : 0;
+    }
 
 private:
     struct CamState {
