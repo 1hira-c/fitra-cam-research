@@ -1,6 +1,7 @@
 #include "pipeline/multi_pipeline.hpp"
 
 #include <chrono>
+#include <stdexcept>
 
 #include "util/logging.hpp"
 
@@ -14,7 +15,14 @@ MultiCameraDriver::MultiCameraDriver(
       rtmpose_{rtmpose},
       bus_{bus},
       latest_per_cam_(sources_.size()),
-      per_cam_(sources_.size()) {}
+      per_cam_(sources_.size()) {
+    for (const auto& source : sources_) {
+        if (!source || !source->prebakes_pose()) {
+            throw std::invalid_argument(
+                "MultiCameraDriver requires FrameSource with RTMPose prebaking enabled");
+        }
+    }
+}
 
 MultiCameraDriver::~MultiCameraDriver() {
     try { stop(); } catch (...) {}
@@ -48,6 +56,9 @@ void MultiCameraDriver::loop() {
     double sum_poll_ms = 0.0, sum_rtm_ms = 0.0, sum_snap_ms = 0.0;
     int    sum_reqs = 0;
     auto   stats_anchor = std::chrono::steady_clock::now();
+    std::vector<bool> warned_missing_prebake(sources_.size(), false);
+    const std::size_t rtmpose_per_item =
+        infer::RtmPose::blob_floats_per_item(rtmpose_.options());
 
     while (!stop_.load()) {
         pending.clear();
@@ -66,16 +77,24 @@ void MultiCameraDriver::loop() {
             PendingCam pc;
             pc.idx           = i;
             pc.person_offset = reqs.size();
-            pc.person_count  = latest_per_cam_[i].bboxes.size();
+            pc.person_count  = 0;
             // FrameSource has already pre-baked the RTMPose inputs.
             const auto& cam_df = latest_per_cam_[i];
-            const std::size_t per_item =
-                cam_df.chw_concat.empty()
-                    ? 0
-                    : cam_df.chw_concat.size() / std::max<std::size_t>(1, cam_df.bboxes.size());
+            if (!cam_df.has_prebaked_pose_inputs(rtmpose_per_item)) {
+                if (!warned_missing_prebake[i]) {
+                    FITRA_LOG_WARN(
+                        "camera {} has {} bboxes but invalid RTMPose prebaked buffers; "
+                        "skipping pose inference for these frames",
+                        i, cam_df.bboxes.size());
+                    warned_missing_prebake[i] = true;
+                }
+                pending.push_back(pc);
+                continue;
+            }
+            pc.person_count = cam_df.bboxes.size();
             for (std::size_t bi = 0; bi < cam_df.bboxes.size(); ++bi) {
                 infer::RtmPose::PrebakedRequest pr;
-                pr.chw   = cam_df.chw_concat.data() + bi * per_item;
+                pr.chw   = cam_df.chw_concat.data() + bi * rtmpose_per_item;
                 pr.M_inv = cam_df.M_invs[bi];
                 pr.bbox  = cam_df.bboxes[bi];
                 reqs.push_back(pr);

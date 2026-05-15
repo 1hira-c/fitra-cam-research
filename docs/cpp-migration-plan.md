@@ -225,6 +225,12 @@ aggregate 170 fps で camera-saturated (88 fps 受信ぎりぎり)。main thread
 dump_keypoints は内部 preprocess 経路 (infer_batch) で max kpt L2 = 1.15 px。
 Phase 1 / 4 / 5 と完全一致。リファクタは数値に影響なし。
 
+Phase 6b の本番経路に近い `dump_keypoints --prebaked` でも Python CPU
+参照比は bbox IoU min = 0.9932、max kpt L2 = 1.1490 px、p95 = 0.5797 px。
+内部 preprocess 経路と同等。ただし `compare_keypoints.py` の既定閾値
+`--kpt-threshold 1.0` は max 値だけ超えるので、判定は既存経路との同等性
+確認として扱う。
+
 ### 残課題 (Phase 7 候補)
 
 - 3 カメラ目の実機接続で aggregate ≥ 250 fps を確認

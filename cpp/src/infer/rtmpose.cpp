@@ -136,11 +136,10 @@ void RtmPose::preprocess_to_blob(const Options& opts,
     M_inv_out = warp_matrix(center, scale, opts.input_w, opts.input_h, true);
 }
 
-void RtmPose::run_one_batch(const Request* reqs,
-                            std::size_t n,
-                            std::vector<Person>& out) {
-    if (n == 0) return;
-
+void RtmPose::prepare_batch_buffers(std::size_t n,
+                                    int& simcc_x_width,
+                                    int& simcc_y_width,
+                                    std::size_t& per_item) {
     // Engine-declared output shapes: (-1, K, Wx) and (-1, K, Wy).
     auto eng_sx = engine_.engine().getTensorShape(opts_.simcc_x_name.c_str());
     auto eng_sy = engine_.engine().getTensorShape(opts_.simcc_y_name.c_str());
@@ -149,19 +148,97 @@ void RtmPose::run_one_batch(const Request* reqs,
         || eng_sy.d[1] != static_cast<int>(kNumKeypoints)) {
         throw std::runtime_error("RTMPose engine output rank/K unexpected");
     }
-    int Wx = eng_sx.d[2];
-    int Wy = eng_sy.d[2];
+    simcc_x_width = eng_sx.d[2];
+    simcc_y_width = eng_sy.d[2];
 
     int H = opts_.input_h;
     int W = opts_.input_w;
-    std::size_t per_item = static_cast<std::size_t>(3) * H * W;
+    per_item = static_cast<std::size_t>(3) * H * W;
     input_blob_.resize(per_item * n);
-    simcc_x_host_.resize(static_cast<std::size_t>(n) * kNumKeypoints * Wx);
-    simcc_y_host_.resize(static_cast<std::size_t>(n) * kNumKeypoints * Wy);
+    simcc_x_host_.resize(static_cast<std::size_t>(n) * kNumKeypoints * simcc_x_width);
+    simcc_y_host_.resize(static_cast<std::size_t>(n) * kNumKeypoints * simcc_y_width);
+}
+
+void RtmPose::enqueue_current_input(std::size_t n) {
+    int H = opts_.input_h;
+    int W = opts_.input_w;
+    nvinfer1::Dims in_dims;
+    in_dims.nbDims = 4;
+    in_dims.d[0] = static_cast<int>(n);
+    in_dims.d[1] = 3;
+    in_dims.d[2] = H;
+    in_dims.d[3] = W;
+    engine_.set_input_shape(opts_.input_name, in_dims);
+
+    engine_.copy_input_from_host(opts_.input_name,
+                                 input_blob_.data(),
+                                 input_blob_.size() * sizeof(float));
+    engine_.enqueue();
+    engine_.copy_output_to_host(opts_.simcc_x_name,
+                                simcc_x_host_.data(),
+                                simcc_x_host_.size() * sizeof(float));
+    engine_.copy_output_to_host(opts_.simcc_y_name,
+                                simcc_y_host_.data(),
+                                simcc_y_host_.size() * sizeof(float));
+    engine_.synchronize();
+}
+
+void RtmPose::decode_current_outputs(std::size_t n,
+                                     int simcc_x_width,
+                                     int simcc_y_width,
+                                     const std::vector<Bbox>& bboxes,
+                                     const std::vector<cv::Mat>& M_invs,
+                                     std::vector<Person>& out) {
+    const std::size_t stride_x =
+        static_cast<std::size_t>(kNumKeypoints) * simcc_x_width;
+    const std::size_t stride_y =
+        static_cast<std::size_t>(kNumKeypoints) * simcc_y_width;
+    for (std::size_t i = 0; i < n; ++i) {
+        Person p{};
+        p.bbox = bboxes[i];
+        const float* base_x = simcc_x_host_.data() + i * stride_x;
+        const float* base_y = simcc_y_host_.data() + i * stride_y;
+        for (std::size_t k = 0; k < kNumKeypoints; ++k) {
+            const float* row_x = base_x + k * simcc_x_width;
+            const float* row_y = base_y + k * simcc_y_width;
+            int   x_arg = 0;
+            float x_max = row_x[0];
+            for (int j = 1; j < simcc_x_width; ++j) {
+                if (row_x[j] > x_max) { x_max = row_x[j]; x_arg = j; }
+            }
+            int   y_arg = 0;
+            float y_max = row_y[0];
+            for (int j = 1; j < simcc_y_width; ++j) {
+                if (row_y[j] > y_max) { y_max = row_y[j]; y_arg = j; }
+            }
+            float score = std::min(x_max, y_max);
+            if (score < 0.0f) score = 0.0f;
+            p.kpts[k].x = static_cast<float>(x_arg) / opts_.simcc_split;
+            p.kpts[k].y = static_cast<float>(y_arg) / opts_.simcc_split;
+            p.kpts[k].score = score;
+        }
+        apply_affine_inplace(M_invs[i], p.kpts);
+        out.push_back(p);
+    }
+}
+
+void RtmPose::run_one_batch(const Request* reqs,
+                            std::size_t n,
+                            std::vector<Person>& out) {
+    if (n == 0) return;
+
+    int Wx = 0;
+    int Wy = 0;
+    std::size_t per_item = 0;
+    prepare_batch_buffers(n, Wx, Wy, per_item);
 
     // Preprocess all items into the batched blob. Runs in parallel for
     // n >= 2 — preprocess_to_blob is thread-safe (no shared scratch).
     std::vector<cv::Mat> M_invs(n);
+    std::vector<Bbox> bboxes(n);
+    for (std::size_t i = 0; i < n; ++i) {
+        bboxes[i] = reqs[i].bbox;
+    }
     if (n >= 2) {
         std::vector<std::thread> threads;
         threads.reserve(n - 1);
@@ -183,57 +260,8 @@ void RtmPose::run_one_batch(const Request* reqs,
                            M_invs[0]);
     }
 
-    // Set dynamic batch dim and run.
-    nvinfer1::Dims in_dims;
-    in_dims.nbDims = 4;
-    in_dims.d[0] = static_cast<int>(n);
-    in_dims.d[1] = 3;
-    in_dims.d[2] = H;
-    in_dims.d[3] = W;
-    engine_.set_input_shape(opts_.input_name, in_dims);
-
-    engine_.copy_input_from_host(opts_.input_name,
-                                 input_blob_.data(),
-                                 input_blob_.size() * sizeof(float));
-    engine_.enqueue();
-    engine_.copy_output_to_host(opts_.simcc_x_name,
-                                simcc_x_host_.data(),
-                                simcc_x_host_.size() * sizeof(float));
-    engine_.copy_output_to_host(opts_.simcc_y_name,
-                                simcc_y_host_.data(),
-                                simcc_y_host_.size() * sizeof(float));
-    engine_.synchronize();
-
-    // Decode each batch item.
-    const std::size_t stride_x = static_cast<std::size_t>(kNumKeypoints) * Wx;
-    const std::size_t stride_y = static_cast<std::size_t>(kNumKeypoints) * Wy;
-    for (std::size_t i = 0; i < n; ++i) {
-        Person p{};
-        p.bbox = reqs[i].bbox;
-        const float* base_x = simcc_x_host_.data() + i * stride_x;
-        const float* base_y = simcc_y_host_.data() + i * stride_y;
-        for (std::size_t k = 0; k < kNumKeypoints; ++k) {
-            const float* row_x = base_x + k * Wx;
-            const float* row_y = base_y + k * Wy;
-            int   x_arg = 0;
-            float x_max = row_x[0];
-            for (int j = 1; j < Wx; ++j) {
-                if (row_x[j] > x_max) { x_max = row_x[j]; x_arg = j; }
-            }
-            int   y_arg = 0;
-            float y_max = row_y[0];
-            for (int j = 1; j < Wy; ++j) {
-                if (row_y[j] > y_max) { y_max = row_y[j]; y_arg = j; }
-            }
-            float score = std::min(x_max, y_max);
-            if (score < 0.0f) score = 0.0f;
-            p.kpts[k].x = static_cast<float>(x_arg) / opts_.simcc_split;
-            p.kpts[k].y = static_cast<float>(y_arg) / opts_.simcc_split;
-            p.kpts[k].score = score;
-        }
-        apply_affine_inplace(M_invs[i], p.kpts);
-        out.push_back(p);
-    }
+    enqueue_current_input(n);
+    decode_current_outputs(n, Wx, Wy, bboxes, M_invs, out);
 }
 
 void RtmPose::run_one_prebaked(const PrebakedRequest* reqs,
@@ -241,80 +269,28 @@ void RtmPose::run_one_prebaked(const PrebakedRequest* reqs,
                                std::vector<Person>& out) {
     if (n == 0) return;
 
-    auto eng_sx = engine_.engine().getTensorShape(opts_.simcc_x_name.c_str());
-    auto eng_sy = engine_.engine().getTensorShape(opts_.simcc_y_name.c_str());
-    if (eng_sx.nbDims != 3 || eng_sy.nbDims != 3
-        || eng_sx.d[1] != static_cast<int>(kNumKeypoints)
-        || eng_sy.d[1] != static_cast<int>(kNumKeypoints)) {
-        throw std::runtime_error("RTMPose engine output rank/K unexpected");
-    }
-    int Wx = eng_sx.d[2];
-    int Wy = eng_sy.d[2];
-
-    int H = opts_.input_h;
-    int W = opts_.input_w;
-    std::size_t per_item = static_cast<std::size_t>(3) * H * W;
-    input_blob_.resize(per_item * n);
-    simcc_x_host_.resize(static_cast<std::size_t>(n) * kNumKeypoints * Wx);
-    simcc_y_host_.resize(static_cast<std::size_t>(n) * kNumKeypoints * Wy);
+    int Wx = 0;
+    int Wy = 0;
+    std::size_t per_item = 0;
+    prepare_batch_buffers(n, Wx, Wy, per_item);
 
     // Pack the prebaked per-item CHW blobs into the contiguous batch buffer.
     // (Cheap memcpy; preprocess itself already ran on the per-camera threads.)
+    std::vector<cv::Mat> M_invs(n);
+    std::vector<Bbox> bboxes(n);
     for (std::size_t i = 0; i < n; ++i) {
+        if (!reqs[i].chw) {
+            throw std::runtime_error("RTMPose prebaked request has null CHW buffer");
+        }
         std::memcpy(input_blob_.data() + i * per_item,
                     reqs[i].chw,
                     per_item * sizeof(float));
+        M_invs[i] = reqs[i].M_inv;
+        bboxes[i] = reqs[i].bbox;
     }
 
-    nvinfer1::Dims in_dims;
-    in_dims.nbDims = 4;
-    in_dims.d[0] = static_cast<int>(n);
-    in_dims.d[1] = 3;
-    in_dims.d[2] = H;
-    in_dims.d[3] = W;
-    engine_.set_input_shape(opts_.input_name, in_dims);
-
-    engine_.copy_input_from_host(opts_.input_name,
-                                 input_blob_.data(),
-                                 input_blob_.size() * sizeof(float));
-    engine_.enqueue();
-    engine_.copy_output_to_host(opts_.simcc_x_name,
-                                simcc_x_host_.data(),
-                                simcc_x_host_.size() * sizeof(float));
-    engine_.copy_output_to_host(opts_.simcc_y_name,
-                                simcc_y_host_.data(),
-                                simcc_y_host_.size() * sizeof(float));
-    engine_.synchronize();
-
-    const std::size_t stride_x = static_cast<std::size_t>(kNumKeypoints) * Wx;
-    const std::size_t stride_y = static_cast<std::size_t>(kNumKeypoints) * Wy;
-    for (std::size_t i = 0; i < n; ++i) {
-        Person p{};
-        p.bbox = reqs[i].bbox;
-        const float* base_x = simcc_x_host_.data() + i * stride_x;
-        const float* base_y = simcc_y_host_.data() + i * stride_y;
-        for (std::size_t k = 0; k < kNumKeypoints; ++k) {
-            const float* row_x = base_x + k * Wx;
-            const float* row_y = base_y + k * Wy;
-            int   x_arg = 0;
-            float x_max = row_x[0];
-            for (int j = 1; j < Wx; ++j) {
-                if (row_x[j] > x_max) { x_max = row_x[j]; x_arg = j; }
-            }
-            int   y_arg = 0;
-            float y_max = row_y[0];
-            for (int j = 1; j < Wy; ++j) {
-                if (row_y[j] > y_max) { y_max = row_y[j]; y_arg = j; }
-            }
-            float score = std::min(x_max, y_max);
-            if (score < 0.0f) score = 0.0f;
-            p.kpts[k].x = static_cast<float>(x_arg) / opts_.simcc_split;
-            p.kpts[k].y = static_cast<float>(y_arg) / opts_.simcc_split;
-            p.kpts[k].score = score;
-        }
-        apply_affine_inplace(reqs[i].M_inv, p.kpts);
-        out.push_back(p);
-    }
+    enqueue_current_input(n);
+    decode_current_outputs(n, Wx, Wy, bboxes, M_invs, out);
 }
 
 std::vector<Person> RtmPose::infer_prebaked(const std::vector<PrebakedRequest>& reqs) {

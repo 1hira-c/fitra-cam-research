@@ -4,8 +4,8 @@
 //
 // Owns one V4l2Capture (own thread for V4L2 dequeue) and runs a second
 // thread that does (decode → optional YOLOX). Publishes the latest
-// (frame, cached_bboxes) pair so the central inference thread only has
-// to batch them into a single RTMPose call.
+// cached bboxes and optional pre-baked RTMPose inputs so the central
+// inference thread only has to batch them into a single RTMPose call.
 //
 // Why "optional" YOLOX: if the caller passes a Yolox*, the per-cam
 // thread runs detection inline. With nullptr, the source is decode-only
@@ -20,6 +20,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -38,6 +39,8 @@
 namespace fitra::camera {
 
 struct DecodedFrame {
+    // Populated only for decode-only sources. Prebaked RTMPose sources leave
+    // this empty to avoid copying a full frame after preprocessing is done.
     cv::Mat                              bgr;
     std::uint64_t                        seq{0};
     std::chrono::steady_clock::time_point captured_at{};
@@ -47,6 +50,13 @@ struct DecodedFrame {
     // Populated when the FrameSource was given a non-null rtmpose_opts.
     std::vector<float>                   chw_concat;
     std::vector<cv::Mat>                 M_invs;
+
+    bool has_prebaked_pose_inputs(std::size_t per_item) const {
+        return bboxes.empty()
+            || (per_item > 0
+                && chw_concat.size() == bboxes.size() * per_item
+                && M_invs.size() == bboxes.size());
+    }
 };
 
 class FrameSource {
@@ -83,6 +93,7 @@ public:
     const V4l2Options& options() const  { return capture_->options(); }
     double recv_fps() const             { return capture_->recv_fps(); }
     std::uint64_t total_received() const{ return capture_->total_received(); }
+    bool prebakes_pose() const          { return rtmpose_enabled_; }
 
 private:
     void decode_loop();

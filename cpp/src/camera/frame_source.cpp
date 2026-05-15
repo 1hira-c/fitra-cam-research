@@ -89,7 +89,6 @@ void FrameSource::decode_loop() {
         }
 
         DecodedFrame df;
-        df.bgr         = scratch.clone();
         df.seq         = raw.seq;
         df.captured_at = raw.captured_at;
         df.bboxes      = cached_bboxes_;  // copy of current cache
@@ -104,10 +103,12 @@ void FrameSource::decode_loop() {
             df.M_invs.resize(df.bboxes.size());
             for (std::size_t i = 0; i < df.bboxes.size(); ++i) {
                 infer::RtmPose::preprocess_to_blob(
-                    rtmpose_opts_, df.bgr, df.bboxes[i],
+                    rtmpose_opts_, scratch, df.bboxes[i],
                     df.chw_concat.data() + i * per_item,
                     df.M_invs[i]);
             }
+        } else if (!rtmpose_enabled_) {
+            df.bgr = scratch.clone();
         }
 
         {

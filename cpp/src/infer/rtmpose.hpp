@@ -96,6 +96,17 @@ private:
     void run_one_prebaked(const PrebakedRequest* reqs,
                           std::size_t n,
                           std::vector<Person>& out);
+    void prepare_batch_buffers(std::size_t n,
+                               int& simcc_x_width,
+                               int& simcc_y_width,
+                               std::size_t& per_item);
+    void enqueue_current_input(std::size_t n);
+    void decode_current_outputs(std::size_t n,
+                                int simcc_x_width,
+                                int simcc_y_width,
+                                const std::vector<Bbox>& bboxes,
+                                const std::vector<cv::Mat>& M_invs,
+                                std::vector<Person>& out);
 
     TrtEngine& engine_;
     Options    opts_;

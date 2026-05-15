@@ -77,6 +77,7 @@ void print_help() {
         "  --fps N                   requested capture fps (default 30)\n"
         "  --det-frequency N         run YOLOX every N frames (default 10)\n"
         "  --multi-person            process all bboxes per camera (default: largest only)\n"
+        "  --bench-fake-bbox         inject synthetic bbox when detections are empty (bench only)\n"
         "  --det-score F             detection score threshold (default 0.5)\n"
         "  --log-every-s F           stats interval in seconds (default 2.0)\n"
         "  --probe                   Phase 0 sanity check and exit\n"
