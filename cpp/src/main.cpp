@@ -177,17 +177,19 @@ int main(int argc, char** argv) {
         std::unique_ptr<nvinfer1::IRuntime> rt{nvinfer1::createInferRuntime(tlog)};
         TRT_CHECK(rt != nullptr);
 
-        FITRA_LOG_INFO("loading YOLOX engine: {}", det_engine_path);
-        auto yolox_eng   = fitra::infer::TrtEngine::from_file(*rt, det_engine_path, tlog);
+        FITRA_LOG_INFO("loading YOLOX engine (shared): {}", det_engine_path);
+        auto yolox_shared = fitra::infer::TrtEngine::load_shared(*rt, det_engine_path);
         FITRA_LOG_INFO("loading RTMPose engine: {}", pose_engine_path);
-        auto rtmpose_eng = fitra::infer::TrtEngine::from_file(*rt, pose_engine_path, tlog);
-
-        fitra::infer::Yolox::Options yolo_opts;
-        yolo_opts.score_thr = det_score;
-        fitra::infer::Yolox   yolox{*yolox_eng, yolo_opts};
+        auto rtmpose_eng  = fitra::infer::TrtEngine::from_file(*rt, pose_engine_path, tlog);
+        // RTMPose stays as a single shared instance — batching across cameras
+        // requires one execution context fed serially from the main thread.
         fitra::infer::RtmPose rtmpose{*rtmpose_eng};
 
-        std::vector<std::unique_ptr<fitra::camera::V4l2Capture>> caps;
+        // One V4l2Capture + one Yolox (per-camera IExecutionContext) per cam.
+        // Engines wrap into FrameSource which runs its own decode + YOLOX
+        // thread, so all N cameras run capture/decode/YOLOX in parallel.
+        std::vector<std::unique_ptr<fitra::infer::TrtEngine>> yolox_engines;
+        std::vector<std::unique_ptr<fitra::camera::FrameSource>> sources;
         for (auto& path : cam_paths) {
             if (path.empty()) continue;
             fitra::camera::V4l2Options o;
@@ -195,15 +197,25 @@ int main(int argc, char** argv) {
             o.width  = width;
             o.height = height;
             o.fps    = fps;
-            caps.push_back(std::make_unique<fitra::camera::V4l2Capture>(o));
+            auto cap = std::make_unique<fitra::camera::V4l2Capture>(o);
+
+            auto yolox_eng = fitra::infer::TrtEngine::from_shared(yolox_shared);
+            fitra::infer::Yolox::Options yolo_opts;
+            yolo_opts.score_thr = det_score;
+            auto yolox = std::make_unique<fitra::infer::Yolox>(*yolox_eng, yolo_opts);
+            yolox_engines.push_back(std::move(yolox_eng));
+
+            fitra::camera::FrameSource::Options src_opts;
+            src_opts.det_frequency = det_frequency;
+            src_opts.single_person = !multi_person;
+            sources.push_back(std::make_unique<fitra::camera::FrameSource>(
+                std::move(cap), std::move(yolox), src_opts));
         }
-        std::size_t n_cams = caps.size();
+        std::size_t n_cams = sources.size();
 
         fitra::pipeline::SnapshotBus bus{n_cams};
-        fitra::pipeline::MultiCameraDriver::Options drv_opts;
-        drv_opts.det_frequency = det_frequency;
-        drv_opts.single_person = !multi_person;
-        fitra::pipeline::MultiCameraDriver driver{std::move(caps), yolox, rtmpose, bus, drv_opts};
+        fitra::pipeline::MultiCameraDriver driver{
+            std::move(sources), rtmpose, bus};
         driver.start();
 
         std::unique_ptr<fitra::web::CrowServer> server;

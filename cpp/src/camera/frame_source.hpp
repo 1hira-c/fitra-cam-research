@@ -1,15 +1,22 @@
 #pragma once
 //
-// Per-camera decode worker.
+// Per-camera worker.
 //
-// Wraps a V4l2Capture (MJPEG producer) and runs a dedicated decode thread
-// that converts the latest JPEG into a BGR cv::Mat. The inference thread
-// pulls decoded frames via try_pop_latest_decoded(), keeping CPU JPEG
-// decode off the inference path so N cameras can decode in parallel.
+// Owns one V4l2Capture (own thread for V4L2 dequeue) and runs a second
+// thread that does (decode → optional YOLOX). Publishes the latest
+// (frame, cached_bboxes) pair so the central inference thread only has
+// to batch them into a single RTMPose call.
 //
-// Replaces the inline cv::imdecode() in MultiCameraDriver::loop. With 2-3
-// cameras on the same iteration, decode latency drops from N*~8ms (serial)
-// to ~8ms (parallel) before RTMPose.
+// Why "optional" YOLOX: if the caller passes a Yolox*, the per-cam
+// thread runs detection inline. With nullptr, the source is decode-only
+// (Phase 2/4 behaviour). Each Yolox is built from a TrtEngine that
+// shares ICudaEngine via TrtEngine::from_shared — TRT execution contexts
+// themselves are not thread-safe, so per-cam Yolox = per-cam context.
+//
+// State for det-frequency decimation + single-person filter lives here
+// rather than in the central pipeline, so each camera tracks its own
+// detection schedule independently of any frames the inference thread
+// dropped (latest-wins).
 
 #include <atomic>
 #include <chrono>
@@ -18,11 +25,14 @@
 #include <mutex>
 #include <optional>
 #include <thread>
+#include <vector>
 
 #include <opencv2/core.hpp>
 
 #include "camera/jpeg_decoder.hpp"
 #include "camera/v4l2_capture.hpp"
+#include "infer/types.hpp"
+#include "infer/yolox.hpp"
 
 namespace fitra::camera {
 
@@ -30,23 +40,28 @@ struct DecodedFrame {
     cv::Mat                              bgr;
     std::uint64_t                        seq{0};
     std::chrono::steady_clock::time_point captured_at{};
+    std::vector<infer::Bbox>             bboxes;  // empty if no Yolox or no person
 };
 
 class FrameSource {
 public:
-    explicit FrameSource(std::unique_ptr<V4l2Capture> capture);
+    struct Options {
+        int  det_frequency = 10;
+        bool single_person = true;
+    };
+
+    // Yolox can be nullptr -> decode-only (no detection).
+    FrameSource(std::unique_ptr<V4l2Capture> capture,
+                std::unique_ptr<infer::Yolox> yolox,
+                Options opts);
     ~FrameSource();
 
     FrameSource(const FrameSource&) = delete;
     FrameSource& operator=(const FrameSource&) = delete;
 
-    void start();   // Starts capture + decode threads.
+    void start();
     void stop();
 
-    // Try to fetch the most-recent decoded frame. Returns false if no new
-    // frame is ready since the last call. The returned cv::Mat shares the
-    // FrameSource's internal buffer (deep-copied via cv::Mat::clone() into
-    // `out.bgr`), so it's safe to use across iterations.
     bool try_pop_latest_decoded(DecodedFrame& out);
 
     V4l2Capture&  capture()             { return *capture_; }
@@ -58,9 +73,16 @@ private:
     void decode_loop();
 
     std::unique_ptr<V4l2Capture> capture_;
-    JpegDecoder                  decoder_;
-    std::thread                  worker_;
-    std::atomic<bool>            stop_{false};
+    std::unique_ptr<infer::Yolox> yolox_;
+    Options                       opts_;
+
+    JpegDecoder            decoder_;
+    std::thread            worker_;
+    std::atomic<bool>      stop_{false};
+
+    // Det-frequency state (touched only by decode_loop).
+    int                      frame_idx_ = 0;
+    std::vector<infer::Bbox> cached_bboxes_;
 
     mutable std::mutex          slot_mu_;
     std::optional<DecodedFrame> latest_;

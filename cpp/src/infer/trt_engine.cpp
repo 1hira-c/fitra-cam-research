@@ -103,8 +103,7 @@ private:
 
 // --- ctor / dtor ---------------------------------------------------------
 
-TrtEngine::TrtEngine(nvinfer1::IRuntime& /*runtime*/,
-                     std::unique_ptr<nvinfer1::ICudaEngine> engine,
+TrtEngine::TrtEngine(std::shared_ptr<nvinfer1::ICudaEngine> engine,
                      std::unique_ptr<nvinfer1::IExecutionContext> context,
                      cudaStream_t stream)
     : engine_{std::move(engine)},
@@ -124,16 +123,15 @@ TrtEngine::~TrtEngine() {
     if (stream_) {
         cudaStreamDestroy(stream_);
     }
-    // engine_/context_ unique_ptrs are released by their default deleters,
-    // which call destroy()-equivalent in TRT 10 via the operator delete that
-    // nvinfer1 ships.
+    // The IExecutionContext is destroyed by its unique_ptr deleter, and
+    // the shared engine is released when the last TrtEngine using it goes
+    // away (engine destroy via TRT's operator delete).
 }
 
 // --- factory -------------------------------------------------------------
 
-std::unique_ptr<TrtEngine> TrtEngine::from_file(nvinfer1::IRuntime& runtime,
-                                                const std::string& engine_path,
-                                                nvinfer1::ILogger& /*logger*/) {
+std::shared_ptr<nvinfer1::ICudaEngine> TrtEngine::load_shared(
+    nvinfer1::IRuntime& runtime, const std::string& engine_path) {
     std::ifstream f{engine_path, std::ios::binary | std::ios::ate};
     if (!f.is_open()) {
         throw std::runtime_error("failed to open engine file: " + engine_path);
@@ -145,19 +143,30 @@ std::unique_ptr<TrtEngine> TrtEngine::from_file(nvinfer1::IRuntime& runtime,
         throw std::runtime_error("failed to read engine file: " + engine_path);
     }
 
-    std::unique_ptr<nvinfer1::ICudaEngine> engine{
-        runtime.deserializeCudaEngine(blob.data(), blob.size())};
-    TRT_CHECK(engine != nullptr);
+    nvinfer1::ICudaEngine* raw =
+        runtime.deserializeCudaEngine(blob.data(), blob.size());
+    TRT_CHECK(raw != nullptr);
+    return std::shared_ptr<nvinfer1::ICudaEngine>{raw};
+}
 
-    std::unique_ptr<nvinfer1::IExecutionContext> ctx{engine->createExecutionContext()};
+std::unique_ptr<TrtEngine> TrtEngine::from_shared(
+    std::shared_ptr<nvinfer1::ICudaEngine> engine) {
+    TRT_CHECK(engine != nullptr);
+    std::unique_ptr<nvinfer1::IExecutionContext> ctx{
+        engine->createExecutionContext()};
     TRT_CHECK(ctx != nullptr);
 
     cudaStream_t stream = nullptr;
     CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
 
-    // private ctor; using new + reset() instead of make_unique
     return std::unique_ptr<TrtEngine>(
-        new TrtEngine(runtime, std::move(engine), std::move(ctx), stream));
+        new TrtEngine(std::move(engine), std::move(ctx), stream));
+}
+
+std::unique_ptr<TrtEngine> TrtEngine::from_file(nvinfer1::IRuntime& runtime,
+                                                const std::string& engine_path,
+                                                nvinfer1::ILogger& /*logger*/) {
+    return from_shared(load_shared(runtime, engine_path));
 }
 
 // --- bindings ------------------------------------------------------------

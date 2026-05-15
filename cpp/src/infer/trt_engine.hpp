@@ -3,10 +3,14 @@
 // Thin wrapper around an nvinfer1::ICudaEngine + IExecutionContext.
 //
 // Owns:
-//   - the deserialized engine
 //   - one execution context (single-threaded use)
 //   - device buffers for every IO tensor
 //   - a CUDA stream
+//
+// Shares (via shared_ptr):
+//   - the deserialized ICudaEngine. Multiple TrtEngine instances can wrap
+//     the same engine, each with their own context — required for
+//     per-camera parallel inference (TRT contexts are not thread-safe).
 //
 // Does NOT own:
 //   - the IRuntime (callers pass one in; runtimes are cheap to share)
@@ -36,10 +40,24 @@ struct TensorBinding {
 
 class TrtEngine {
 public:
-    // Build an engine from a serialized .plan/.engine file.
+    // Build an engine from a serialized .plan/.engine file. Returns a
+    // TrtEngine that owns its own copy of the deserialized network.
     static std::unique_ptr<TrtEngine> from_file(nvinfer1::IRuntime& runtime,
                                                 const std::string& engine_path,
                                                 nvinfer1::ILogger& logger);
+
+    // Load just the deserialized network so several TrtEngines can share
+    // it. Each TrtEngine still holds its own IExecutionContext, stream and
+    // device buffers — only the (large, read-only) engine is shared.
+    static std::shared_ptr<nvinfer1::ICudaEngine> load_shared(
+        nvinfer1::IRuntime& runtime,
+        const std::string& engine_path);
+
+    // Build a TrtEngine around a pre-loaded ICudaEngine. The engine is
+    // shared via shared_ptr so callers can construct N TrtEngines (one per
+    // thread) sharing one ICudaEngine.
+    static std::unique_ptr<TrtEngine> from_shared(
+        std::shared_ptr<nvinfer1::ICudaEngine> engine);
 
     ~TrtEngine();
 
@@ -82,8 +100,7 @@ private:
     // -1 dims, where TRT only reports the runtime size via notifyShape.
     class BindingOutputAllocator;
 
-    TrtEngine(nvinfer1::IRuntime& runtime,
-              std::unique_ptr<nvinfer1::ICudaEngine> engine,
+    TrtEngine(std::shared_ptr<nvinfer1::ICudaEngine> engine,
               std::unique_ptr<nvinfer1::IExecutionContext> context,
               cudaStream_t stream);
 
@@ -93,7 +110,7 @@ private:
     void install_output_allocator(TensorBinding& b);
     void bind_addresses();
 
-    std::unique_ptr<nvinfer1::ICudaEngine>       engine_;
+    std::shared_ptr<nvinfer1::ICudaEngine>       engine_;
     std::unique_ptr<nvinfer1::IExecutionContext> context_;
     cudaStream_t                                 stream_;
     std::vector<TensorBinding>                   bindings_;

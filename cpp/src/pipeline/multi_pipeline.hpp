@@ -1,13 +1,16 @@
 #pragma once
 //
-// N-camera driver:
-//   - N V4l2Capture instances (each runs its own capture thread)
-//   - 1 inference thread that round-robins through cameras, sharing
-//     a single Yolox and RtmPose (one TRT execution context each)
-//   - SnapshotBus for the publisher to read from
+// N-camera driver.
 //
-// This deliberately mirrors the Python dual_rtmpose_web.py shape so the
-// existing web/dual_rtmpose/ frontend can be served unchanged.
+// Each camera has its own FrameSource (own V4L2 thread + own decode/YOLOX
+// thread with its own TRT execution context). This central driver only
+// polls the per-camera ready slots, batches the resulting (frame, bbox)
+// requests into one RTMPose call, and distributes the persons back to
+// per-camera snapshots.
+//
+// The Yolox / Yolox-engine plumbing now lives in main.cpp (constructs one
+// shared ICudaEngine for YOLOX and N per-camera Yolox/IExecutionContexts)
+// and inside FrameSource, not here.
 
 #include <atomic>
 #include <chrono>
@@ -17,9 +20,7 @@
 #include <vector>
 
 #include "camera/frame_source.hpp"
-#include "camera/v4l2_capture.hpp"
 #include "infer/rtmpose.hpp"
-#include "infer/yolox.hpp"
 #include "pipeline/pose_pipeline.hpp"
 #include "pipeline/snapshot.hpp"
 
@@ -27,16 +28,9 @@ namespace fitra::pipeline {
 
 class MultiCameraDriver {
 public:
-    struct Options {
-        int  det_frequency = 10;
-        bool single_person = true;
-    };
-
-    MultiCameraDriver(std::vector<std::unique_ptr<camera::V4l2Capture>> caps,
-                      infer::Yolox& yolox,
+    MultiCameraDriver(std::vector<std::unique_ptr<camera::FrameSource>> sources,
                       infer::RtmPose& rtmpose,
-                      SnapshotBus& bus,
-                      Options opts);
+                      SnapshotBus& bus);
     ~MultiCameraDriver();
 
     MultiCameraDriver(const MultiCameraDriver&) = delete;
@@ -50,9 +44,6 @@ public:
 
 private:
     struct CamState {
-        cv::Mat              frame;
-        int                  frame_idx = 0;
-        std::vector<infer::Bbox> cached_bboxes;
         PipelineStats        stats;
         std::deque<std::chrono::steady_clock::time_point> recent;
         std::chrono::steady_clock::time_point start_time = std::chrono::steady_clock::now();
@@ -63,17 +54,16 @@ private:
                       std::chrono::steady_clock::time_point now,
                       std::chrono::steady_clock::time_point captured_at);
 
-    // One FrameSource per camera; each owns a V4l2Capture + its own
-    // decode thread so JPEG decode runs in parallel across cameras.
     std::vector<std::unique_ptr<camera::FrameSource>> sources_;
-    infer::Yolox&        yolox_;
     infer::RtmPose&      rtmpose_;
     SnapshotBus&         bus_;
-    Options              opts_;
 
-    std::vector<CamState> per_cam_;
-    std::thread           worker_;
-    std::atomic<bool>     stop_{false};
+    // Latest decoded frame + bboxes per camera, kept alive across the
+    // RTMPose batched call so we can hand cv::Mat pointers into reqs.
+    std::vector<camera::DecodedFrame> latest_per_cam_;
+    std::vector<CamState>             per_cam_;
+    std::thread                       worker_;
+    std::atomic<bool>                 stop_{false};
 };
 
 }  // namespace fitra::pipeline

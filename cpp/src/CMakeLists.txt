@@ -32,6 +32,7 @@ target_include_directories(fitra_camera PUBLIC
 )
 
 target_link_libraries(fitra_camera PUBLIC
+    fitra_infer       # FrameSource owns a Yolox (per-camera context)
     Threads::Threads
     opencv_core
     opencv_imgcodecs
