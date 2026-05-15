@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstring>
 #include <stdexcept>
+#include <thread>
 
 #include <opencv2/imgproc.hpp>
 
@@ -107,27 +108,31 @@ void RtmPose::preprocess_one(const cv::Mat& frame_bgr,
                  / static_cast<float>(opts_.input_h);
     bbox_to_cs(bb, opts_.padding, aspect, center, scale);
 
+    // Function-local scratch so multiple threads can call preprocess_one
+    // concurrently without racing on shared cv::Mat. cv::warpAffine reuses
+    // the dst allocation on subsequent calls if size/type match.
+    cv::Mat warp;
     cv::Mat M = warp_matrix(center, scale, opts_.input_w, opts_.input_h, false);
-    cv::warpAffine(frame_bgr, warp_, M,
+    cv::warpAffine(frame_bgr, warp, M,
                    cv::Size(opts_.input_w, opts_.input_h),
                    cv::INTER_LINEAR);
-    warp_.convertTo(warp_f_, CV_32FC3);
 
-    // Per-pixel normalize and split into CHW BGR (channel-major).
-    int H = warp_f_.rows;
-    int W = warp_f_.cols;
-    int npx = H * W;
-    const float* src = warp_f_.ptr<float>();
+    // Fuse uint8 -> float32 + per-channel normalize + HWC -> CHW into one
+    // pass over the warped image.
+    const int H   = warp.rows;
+    const int W   = warp.cols;
+    const int npx = H * W;
+    const std::uint8_t* src = warp.ptr<std::uint8_t>();
     float* ch_b = dst_chw + 0 * npx;
     float* ch_g = dst_chw + 1 * npx;
     float* ch_r = dst_chw + 2 * npx;
+    const float inv_std_b = 1.0f / kStdB;
+    const float inv_std_g = 1.0f / kStdG;
+    const float inv_std_r = 1.0f / kStdR;
     for (int i = 0; i < npx; ++i) {
-        float b = src[i * 3 + 0];
-        float g = src[i * 3 + 1];
-        float r = src[i * 3 + 2];
-        ch_b[i] = (b - kMeanB) / kStdB;
-        ch_g[i] = (g - kMeanG) / kStdG;
-        ch_r[i] = (r - kMeanR) / kStdR;
+        ch_b[i] = (static_cast<float>(src[i * 3 + 0]) - kMeanB) * inv_std_b;
+        ch_g[i] = (static_cast<float>(src[i * 3 + 1]) - kMeanG) * inv_std_g;
+        ch_r[i] = (static_cast<float>(src[i * 3 + 2]) - kMeanR) * inv_std_r;
     }
 
     M_inv_out = warp_matrix(center, scale, opts_.input_w, opts_.input_h, true);
@@ -156,12 +161,28 @@ void RtmPose::run_one_batch(const Request* reqs,
     simcc_x_host_.resize(static_cast<std::size_t>(n) * kNumKeypoints * Wx);
     simcc_y_host_.resize(static_cast<std::size_t>(n) * kNumKeypoints * Wy);
 
-    // Preprocess all items into the batched blob.
+    // Preprocess all items into the batched blob. Runs in parallel for
+    // n >= 2 — preprocess_one is now thread-safe (no shared scratch).
     std::vector<cv::Mat> M_invs(n);
-    for (std::size_t i = 0; i < n; ++i) {
-        preprocess_one(*reqs[i].frame, reqs[i].bbox,
-                       input_blob_.data() + i * per_item,
-                       M_invs[i]);
+    if (n >= 2) {
+        std::vector<std::thread> threads;
+        threads.reserve(n - 1);
+        for (std::size_t i = 1; i < n; ++i) {
+            threads.emplace_back([&, i]() {
+                preprocess_one(*reqs[i].frame, reqs[i].bbox,
+                               input_blob_.data() + i * per_item,
+                               M_invs[i]);
+            });
+        }
+        // Use the caller thread for item 0 to avoid an extra thread.
+        preprocess_one(*reqs[0].frame, reqs[0].bbox,
+                       input_blob_.data(),
+                       M_invs[0]);
+        for (auto& t : threads) t.join();
+    } else {
+        preprocess_one(*reqs[0].frame, reqs[0].bbox,
+                       input_blob_.data(),
+                       M_invs[0]);
     }
 
     // Set dynamic batch dim and run.

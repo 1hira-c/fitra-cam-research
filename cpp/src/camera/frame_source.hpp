@@ -48,6 +48,11 @@ public:
     struct Options {
         int  det_frequency = 10;
         bool single_person = true;
+        // Debug/bench: when YOLOX is enabled but the cache is empty after
+        // detection, inject a synthetic bbox covering the central 60% of
+        // the frame so the downstream RTMPose stage always has work. Use
+        // only for pipeline-ceiling measurement without a subject in view.
+        bool fake_bbox_if_empty = false;
     };
 
     // Yolox can be nullptr -> decode-only (no detection).

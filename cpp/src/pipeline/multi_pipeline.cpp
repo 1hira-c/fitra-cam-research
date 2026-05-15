@@ -43,9 +43,16 @@ void MultiCameraDriver::loop() {
     std::vector<PendingCam>              pending;
     std::vector<infer::RtmPose::Request> reqs;
 
+    // Rolling stage breakdown (debug aid; prints every ~3s of work).
+    int    iter_count = 0;
+    double sum_poll_ms = 0.0, sum_rtm_ms = 0.0, sum_snap_ms = 0.0;
+    int    sum_reqs = 0;
+    auto   stats_anchor = std::chrono::steady_clock::now();
+
     while (!stop_.load()) {
         pending.clear();
         reqs.clear();
+        auto iter_start = std::chrono::steady_clock::now();
 
         // Pass 1: pull the latest (frame, bboxes) from each FrameSource.
         // Decode + YOLOX already ran in the per-camera worker thread.
@@ -71,12 +78,14 @@ void MultiCameraDriver::loop() {
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
             continue;
         }
+        auto t_after_poll = std::chrono::steady_clock::now();
 
         // Pass 2: one batched RTMPose call across all cameras' bboxes.
         std::vector<infer::Person> all_persons;
         if (!reqs.empty()) {
             all_persons = rtmpose_.infer_batch(reqs);
         }
+        auto t_after_rtm = std::chrono::steady_clock::now();
 
         // Pass 3: distribute + update snapshot bus.
         auto wall_now = std::chrono::system_clock::now();
@@ -109,6 +118,31 @@ void MultiCameraDriver::loop() {
             snap.pending         = recv > snap.processed ? recv - snap.processed : 0;
             snap.stage_ms        = cs.stats.last_stage_ms;
             bus_.update(snap);
+        }
+        auto t_after_snap = std::chrono::steady_clock::now();
+
+        ++iter_count;
+        sum_poll_ms += std::chrono::duration<double, std::milli>(t_after_poll  - iter_start).count();
+        sum_rtm_ms  += std::chrono::duration<double, std::milli>(t_after_rtm   - t_after_poll).count();
+        sum_snap_ms += std::chrono::duration<double, std::milli>(t_after_snap  - t_after_rtm).count();
+        sum_reqs    += static_cast<int>(reqs.size());
+
+        auto elapsed = std::chrono::duration<double>(t_after_snap - stats_anchor).count();
+        if (elapsed >= 3.0) {
+            double iter_ms = (sum_poll_ms + sum_rtm_ms + sum_snap_ms) / iter_count;
+            char buf[256];
+            std::snprintf(buf, sizeof(buf),
+                          "breakdown iter_ms=%.2f poll=%.2f rtm=%.2f (per-cam avg %.2f reqs) snap=%.2f",
+                          iter_ms,
+                          sum_poll_ms / iter_count,
+                          sum_rtm_ms  / iter_count,
+                          static_cast<double>(sum_reqs) / iter_count,
+                          sum_snap_ms / iter_count);
+            FITRA_LOG_INFO("{}", buf);
+            iter_count = 0;
+            sum_poll_ms = sum_rtm_ms = sum_snap_ms = 0.0;
+            sum_reqs = 0;
+            stats_anchor = t_after_snap;
         }
     }
 }

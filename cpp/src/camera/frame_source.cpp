@@ -70,6 +70,18 @@ void FrameSource::decode_loop() {
             }
         }
 
+        if (opts_.fake_bbox_if_empty && cached_bboxes_.empty()) {
+            infer::Bbox fake{};
+            float w = static_cast<float>(scratch.cols);
+            float h = static_cast<float>(scratch.rows);
+            fake.x1 = 0.2f * w;
+            fake.y1 = 0.2f * h;
+            fake.x2 = 0.8f * w;
+            fake.y2 = 0.8f * h;
+            fake.score = 1.0f;
+            cached_bboxes_.push_back(fake);
+        }
+
         DecodedFrame df;
         df.bgr         = scratch.clone();
         df.seq         = raw.seq;

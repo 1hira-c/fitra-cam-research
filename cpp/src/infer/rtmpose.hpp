@@ -73,9 +73,8 @@ private:
     TrtEngine& engine_;
     Options    opts_;
 
-    // Reusable host buffers; sized for max_batch.
-    cv::Mat warp_;                       // 256x192x3 uint8
-    cv::Mat warp_f_;                     // 256x192x3 float32 (normalized)
+    // Reusable host buffers; sized for max_batch. preprocess_one keeps its
+    // warp scratch on the stack so multiple threads can run it in parallel.
     std::vector<float> input_blob_;      // B*3*H*W CHW float32
     std::vector<float> simcc_x_host_;    // B*K*Wx
     std::vector<float> simcc_y_host_;    // B*K*Wy
