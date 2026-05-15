@@ -1,13 +1,19 @@
 #include "camera/frame_source.hpp"
 
+#include <algorithm>
 #include <chrono>
+#include <utility>
 
 #include "util/logging.hpp"
 
 namespace fitra::camera {
 
-FrameSource::FrameSource(std::unique_ptr<V4l2Capture> capture)
-    : capture_{std::move(capture)} {}
+FrameSource::FrameSource(std::unique_ptr<V4l2Capture> capture,
+                         std::unique_ptr<infer::Yolox> yolox,
+                         Options opts)
+    : capture_{std::move(capture)},
+      yolox_{std::move(yolox)},
+      opts_{std::move(opts)} {}
 
 FrameSource::~FrameSource() {
     try { stop(); } catch (...) {}
@@ -40,12 +46,40 @@ void FrameSource::decode_loop() {
             FITRA_LOG_WARN("frame_source: jpeg decode failed for seq={}", raw.seq);
             continue;
         }
+
+        // YOLOX runs on this thread (one IExecutionContext per FrameSource),
+        // so all cameras detect in parallel.
+        if (yolox_) {
+            bool do_detect = (frame_idx_ % opts_.det_frequency == 0)
+                          || cached_bboxes_.empty();
+            if (do_detect) {
+                auto dets = yolox_->infer(scratch);
+                if (opts_.single_person && dets.size() > 1) {
+                    auto largest = std::max_element(
+                        dets.begin(), dets.end(),
+                        [](const auto& a, const auto& b) {
+                            float aa = (a.x2 - a.x1) * (a.y2 - a.y1);
+                            float bb = (b.x2 - b.x1) * (b.y2 - b.y1);
+                            return aa < bb;
+                        });
+                    infer::Bbox keep = *largest;
+                    dets.clear();
+                    dets.push_back(keep);
+                }
+                cached_bboxes_ = std::move(dets);
+            }
+        }
+
         DecodedFrame df;
-        df.bgr         = scratch.clone();  // detach from scratch so we can reuse it
+        df.bgr         = scratch.clone();
         df.seq         = raw.seq;
         df.captured_at = raw.captured_at;
-        std::lock_guard<std::mutex> lk{slot_mu_};
-        latest_ = std::move(df);
+        df.bboxes      = cached_bboxes_;  // copy of current cache
+        {
+            std::lock_guard<std::mutex> lk{slot_mu_};
+            latest_ = std::move(df);
+        }
+        ++frame_idx_;
     }
 }
 

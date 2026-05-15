@@ -171,6 +171,78 @@ fitra-cam/
 - **engine cache invalidate**: TRT バージョン / FP16 設定 / GPU SM が変わったら .engine 無効。`models/` の `.engine` は git 管理しない
 - **FP16 RTMPose drift (再確認)**: Phase 1 の correctness で観測 — RTMPose を FP16 engine で回すと、低スコア keypoint (score < 0.5 帯) が input frame の Y で 100-200px ずれることがある。FP32 engine なら max kpt L2 ≈ 1.15px / p95 ≈ 0.57px に収まる。Phase 4 で INT8/FP16 を扱うときは Phase 1 と同じ動画 (`outputs/recorded_rtmpose/20260515_064342/raw_cam0.mp4`) で再現テストすること
 
+## Phase 5 着地メモ (2026-05-15)  branch `cpp-phase5`
+
+Phase 4 で残った最大支配 (推論スレッド側の逐次 YOLOX = ~26 ms/call)
+を per-camera 並列化することで解消。
+
+### 5a — TrtEngine の共有可能化
+`TrtEngine` は元々 `unique_ptr<ICudaEngine>` を抱える持ち主だったが、
+TRT execution context が thread-safe ではないので per-cam 並列推論には
+N 個の context が要る。
+
+- `engine_` を `shared_ptr<ICudaEngine>` に変更。
+- 新規 API:
+  - `TrtEngine::load_shared(runtime, path) → shared_ptr<ICudaEngine>`
+  - `TrtEngine::from_shared(shared_ptr) → unique_ptr<TrtEngine>`
+- 1 個の deserialized ICudaEngine を main で読み、各カメラで
+  `from_shared()` を呼ぶと per-cam な IExecutionContext を持つ
+  `TrtEngine` が出来上がる。device buffer / stream / bindings は
+  TrtEngine ごとに独立。
+
+### 5b — per-camera YOLOX を FrameSource に同居
+`camera::FrameSource` を「decode 専用」から「decode + YOLOX」に拡張:
+- ctor で `std::unique_ptr<infer::Yolox>` を受け取る (nullptr 可)。
+- decode worker で `decoder_.decode(...)` の直後に
+  det-frequency / single-person フィルタ込みで `yolox->infer()`。
+- 公開する `DecodedFrame` に `bboxes` を入れて、 main 側が
+  そのまま RTMPose batched に渡せるようにした。
+- `MultiCameraDriver` から YOLOX 参照と det_frequency state が
+  消え、3 パスのうちパス 1 が単純な「latest slot ポーリング」だけになる。
+
+main.cpp の繋ぎ込みは:
+```
+  yolox_shared = TrtEngine::load_shared(runtime, det_engine_path);
+  rtmpose_eng  = TrtEngine::from_file(...);           // 共有不要 (バッチ専用)
+  for each cam:
+    yolox_eng = TrtEngine::from_shared(yolox_shared); // per-cam context
+    yolox     = Yolox(*yolox_eng, opts);
+    source    = FrameSource(capture, move(yolox), src_opts);
+```
+
+### ベンチ (live 2 cam, det-frequency=10, 持続値)
+
+| 構成 | per-cam recent_pose | aggregate | vs Phase 3 |
+|---|---|---|---|
+| Phase 3 baseline (B=1, serial decode, FP32) | 15.7 fps | 31.4 fps | 1.00× |
+| Phase 4a+b cross-cam batched RTMPose | 15.4 fps | 30.8 fps | 0.98× |
+| Phase 4d parallel CPU decode | 19.3 fps | 38.6 fps | 1.23× |
+| Phase 4c FP16 YOLOX (緩 correctness) | 26.7 fps | 53.5 fps | 1.70× |
+| **Phase 5 per-cam YOLOX + RTMPose-M FP16** | **30.0 fps** | **60.0 fps** | **1.91×** |
+
+Phase 5 構成は **2 カメラ × 30fps が camera-bound に張り付く** 状態 ——
+推論側に余裕があり、3 カメラ目を足せば aggregate ≥ 90 fps 目標を
+満たす見込み (要 USB 帯域の確認)。stage_ms も 60-90ms → 25-34ms に半減。
+
+### Correctness (raw_cam0.mp4 30 frames, Phase 5 build)
+
+| pose engine | dump_keypoints fps | max kpt L2 vs Python CPU | 判定 |
+|---|---|---|---|
+| RTMPose-S FP32 | 21.33 | 1.15 px | ✓ Phase 1 と同一 |
+| RTMPose-M FP16 | 19.63 | 2.51 px | ✓ Phase 4c と同一 |
+
+(dump_keypoints は単一カメラ経路なので Phase 5 並列化と無関係に通る。
+リファクタが既存パスを壊していないことの回帰確認。)
+
+### 残課題 (Phase 6 候補)
+
+- 3 カメラ目を物理接続して aggregate ≥ 90 fps を確認
+- GPU 前処理 (warpAffine + 正規化 + HWC→CHW を CUDA カーネル化) で
+  RTMPose 周りの CPU 時間を削る
+- Jetson MMAPI NvJpegDecoder + NvBuffer zero-copy
+- INT8 PTQ (RTMPose-M / YOLOX、calibration set 選定)
+- pinned memory (`cudaHostAllocMapped`) で H2D/D2H 短縮
+
 ## Phase 4 着地メモ (2026-05-15)  branch `cpp-phase4`
 
 最終目標 (3 cam × 30fps aggregate ≥ 90fps, Python 比 4×) **未達**。
