@@ -16,7 +16,7 @@
 #include <thread>
 #include <vector>
 
-#include "camera/jpeg_decoder.hpp"
+#include "camera/frame_source.hpp"
 #include "camera/v4l2_capture.hpp"
 #include "infer/rtmpose.hpp"
 #include "infer/yolox.hpp"
@@ -45,12 +45,11 @@ public:
     void start();
     void stop();
 
-    std::size_t camera_count() const { return caps_.size(); }
+    std::size_t camera_count() const { return sources_.size(); }
     const PipelineStats& stats_for(std::size_t i) const { return per_cam_[i].stats; }
 
 private:
     struct CamState {
-        camera::JpegDecoder  decoder;
         cv::Mat              frame;
         int                  frame_idx = 0;
         std::vector<infer::Bbox> cached_bboxes;
@@ -60,12 +59,13 @@ private:
     };
 
     void loop();
-    void process_one(std::size_t cam_idx);
     void update_stats(CamState& cs,
                       std::chrono::steady_clock::time_point now,
                       std::chrono::steady_clock::time_point captured_at);
 
-    std::vector<std::unique_ptr<camera::V4l2Capture>> caps_;
+    // One FrameSource per camera; each owns a V4l2Capture + its own
+    // decode thread so JPEG decode runs in parallel across cameras.
+    std::vector<std::unique_ptr<camera::FrameSource>> sources_;
     infer::Yolox&        yolox_;
     infer::RtmPose&      rtmpose_;
     SnapshotBus&         bus_;
