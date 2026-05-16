@@ -2,7 +2,7 @@
 //
 // Usage:
 //   build_engines --onnx <path> --output <path> [--fp16]
-//                 [--workspace-mb N]
+//                 [--int8 --int8-blobs <path>] [--workspace-mb N]
 //                 [--profile name:minD:optD:maxD]   (repeatable)
 //
 // Profile dims are comma-separated, e.g. "input:1x3x256x192:1x3x256x192:3x3x256x192".
@@ -15,6 +15,7 @@
 // Phase 1 use (one command per model; line continuations omitted on purpose):
 //   build_engines --preset yolox   --onnx <yolox_tiny....onnx>   --output models/yolox_tiny.fp16.engine   --fp16
 //   build_engines --preset rtmpose --onnx <rtmpose-s....onnx>    --output models/rtmpose_s.fp16.engine    --fp16
+//   build_engines --preset rtmpose --onnx <rtmpose-s....onnx>    --output models/rtmpose_s.int8.engine    --int8 --int8-blobs models/calib_rtmpose_256x192.bin
 
 #include <cstdio>
 #include <cstdlib>
@@ -104,7 +105,10 @@ void print_help() {
         "\n"
         "Optional:\n"
         "  --fp16                enable FP16 (Jetson Orin Nano Super: recommended)\n"
-        "  --int8                enable INT8 (Phase 4; no calibrator wired yet)\n"
+        "  --int8                enable INT8 PTQ (requires --int8-blobs)\n"
+        "  --int8-blobs PATH     raw float32 calibration blobs, headerless NCHW samples\n"
+        "  --int8-cache PATH     calibration cache path (default: OUTPUT.calib.cache)\n"
+        "  --int8-batch-size N   calibration batch size (default 1)\n"
         "  --workspace-mb N      builder workspace (default 1024)\n"
         "  --profile NAME:MIN:OPT:MAX  dynamic-shape profile (repeatable)\n"
         "                              e.g. input:1x3x256x192:1x3x256x192:3x3x256x192\n"
@@ -139,6 +143,12 @@ int main(int argc, char** argv) {
             opts.fp16 = true;
         } else if (a == "--int8") {
             opts.int8 = true;
+        } else if (a == "--int8-blobs") {
+            opts.int8_blob_path = need_arg("--int8-blobs");
+        } else if (a == "--int8-cache") {
+            opts.int8_cache_path = need_arg("--int8-cache");
+        } else if (a == "--int8-batch-size") {
+            opts.int8_batch_size = std::stoi(need_arg("--int8-batch-size"));
         } else if (a == "--workspace-mb") {
             opts.workspace_mb = static_cast<std::size_t>(std::stoul(need_arg("--workspace-mb")));
         } else if (a == "--profile") {
@@ -154,6 +164,14 @@ int main(int argc, char** argv) {
 
     if (opts.onnx_path.empty() || opts.engine_path.empty()) {
         std::fprintf(stderr, "both --onnx and --output are required\n");
+        return EXIT_FAILURE;
+    }
+    if (opts.int8 && opts.int8_blob_path.empty()) {
+        std::fprintf(stderr, "--int8 requires --int8-blobs PATH\n");
+        return EXIT_FAILURE;
+    }
+    if (opts.int8_batch_size <= 0) {
+        std::fprintf(stderr, "--int8-batch-size must be positive\n");
         return EXIT_FAILURE;
     }
 

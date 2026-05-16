@@ -2,6 +2,7 @@
 add_library(fitra_infer STATIC
     infer/trt_engine.cpp
     infer/trt_builder.cpp
+    infer/int8_calibrator.cpp
     infer/yolox.cpp
     infer/rtmpose.cpp
 )
